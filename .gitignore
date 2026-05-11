@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+
+# venv
+.venv/
+venv/
+env/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 项目运行产物 —— 含真实业务截图 / UI dump / 私信发送记录,绝不能上传公开
+outputs/
+
+# 临时文件
+*.log
+/tmp/
+*.tmp

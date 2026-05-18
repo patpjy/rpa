@@ -9,7 +9,7 @@ YAML 不动,改的是执行器位置(PC ↔ 手机自身)。
 
 ---
 
-## 当前状态(2026-05-15)
+## 当前状态(2026-05-18)
 
 | 阶段 | 状态 | 备注 |
 |---|---|---|
@@ -17,7 +17,7 @@ YAML 不动,改的是执行器位置(PC ↔ 手机自身)。
 | **Phase 1** 公网服务器 | 🟢 已部署 | 腾讯云 VPS 81.69.43.246,FastAPI + Mosquitto + systemd |
 | **Phase 2** APK + 17 action | 🟢 完成 | Kotlin,17/17 actions(`tap_image` / `image_exists` 为 stub,等 OpenCV)|
 | **Phase 3** 无 USB 持久化 | 🟢 实证 | 2026-05-15 honor50-01 拔 USB + 关 WiFi 后 Shizuku 持续运行,workflow 远程可控 |
-| **Phase 4** 工作流真机调优 | 🟡 进行 | candidate 1-3 成功率改善中,forensics + 8s timeout + pipe drain 已修 |
+| **Phase 4** 工作流真机调优 | 🟢 实证 | 2026-05-18 candidate 3/3 跑通 WiFi + SIM 卡纯蜂窝双场景;MQTT QoS 分级 + `maxInflight=100` 治 SIM 弱网卡死,ShellExecutor watchdog 替换 buggy `waitFor(timeout)`,step_progress 心跳 + 5min stale watchdog 全套韧性上线(详见 `BUGS.md`)|
 | **Phase 5** 多机并发 + 风控 + TLS | ⚪ 未启 | 5-10 台并发实测、broker TLS+ACL、包名/痕迹隐藏 |
 
 整体计划草案: `~/.claude/plans/plan-virtual-brooks.md`
@@ -95,6 +95,8 @@ V9.1 单机                                 群控架构
 - USB 在的时候启 shizuku,拔 USB 100% 必死(2 次复现,第二次还加了 nohup setsid 也救不回来)
 - 先拔 USB 让 adbd 进 TCP-only 稳态后再启 shizuku → 多次拔插 USB / 关 WiFi / 切蜂窝都不死
 
+**⚠ 2026-05-18 补丁**:**即使 shizuku 在 TCP-stable 状态启动,后续 `adb install` 仍会带它一起死**。`pm install` 内部走 shell UID 路径会清掉所有 shell UID 子进程,shizuku_server 一并被收。结论:**装新 APK = 重新 bootstrap shizuku**,按 `RECONNECT_SOP.md` 30 秒救回(USB-stable 起 → 立刻拔 USB → TCP 起 shizuku)。
+
 ---
 
 ## 单机手机 bootstrap SOP
@@ -155,6 +157,9 @@ adb -s <phone_wifi_ip>:5555 shell ps -A -o PID,PPID,USER,ARGS | grep shizuku_ser
 ```
 rpa/
 ├── README.md                       本文件
+├── ARCHITECTURE.md                 跨架构链路拓扑(Mac ↔ broker ↔ 手机 / Shizuku ↔ shell)
+├── BUGS.md                         踩过的 bug + 根因 + 修复(2026-05-18 SIM 弱网 etc.)
+├── RECONNECT_SOP.md                shizuku_server 死了 30s 救活 runbook
 ├── requirements.txt                V9.1 Python 依赖
 ├── rpa_mvp.py                      V9.1 引擎(818 行,uiautomator2 + ADB)
 ├── dashboard.py                    V9.1 控制台(Flask :8003)
@@ -312,6 +317,27 @@ ssh -fN -L 8888:127.0.0.1:8000 dyrpa
 
 → 抖音 UI 漂移时 1 次 run 即拿证据,不靠蒙猜。
 
+### 通信韧性(MQTT,2026-05-18 治 SIM 弱网卡死)
+
+```kotlin
+// MqttClient.kt
+maxInflight = 100               // Paho 默认 10,SIM 卡 RTT 200-800ms 时 inflight 必爆
+private val CRITICAL_EVENT_TYPES = setOf(
+    "task_started", "task_done", "task_failed", "candidate_complete",
+)
+val critical = type in CRITICAL_EVENT_TYPES
+val qos = if (critical) 1 else 0   // 高频事件 (log/step_*) 走 QoS 0,fire-and-forget,不占 inflight 槽
+```
+
+**没分级前症状**:WiFi 跑 3/3 通,SIM 卡纯蜂窝下 workflow 静默卡 100+ 秒,无报错无心跳,5min 后 server 端 stale watchdog 才标 failed。完整根因分析见 `BUGS.md` 第一条。
+
+**配套韧性栈**(从上至下:server → APK 主流 → 子进程):
+- **`server/app/main.py`**:5min `stale_task_watchdog` 60s 轮询扫 zombie task,清 `Device.current_task_id` + bus 写 warn
+- **`server/app/mqtt_router.py`**:任何手机端 lifecycle event(含 `step_progress`)刷新 `task.last_event_at`,watchdog 不误杀
+- **`apk/.../workflow/Interpreter.kt`**:每个 step 启 daemon Thread 每 5s 发 `step_progress` 心跳,卡 step 时 dashboard 看得到 elapsed_ms
+- **`apk/.../mqtt/MqttClient.kt`**:`pendingQueue` 上限 100,`MqttCallbackExtended.connectComplete(reconnect=true)` 时 drain 重发,弱网断点不丢 critical 事件
+- **`apk/.../shizuku/ShellExecutor.kt`**:waiter Thread + `join(timeoutMs+3s)` 替换 Shizuku Process 子类下 buggy 的 `proc.waitFor(timeout, TimeUnit)`(那个会假性 return true 然后 `exitValue()` 抛 `IllegalThreadStateException("process hasn't exited")`)
+
 ### ShellExecutor 并发排空 stdout/stderr(pipe 死锁修复)
 
 ```kotlin
@@ -387,6 +413,9 @@ drafts:
 | 服务器 `/api/health` 偶发 `HTTP 000` | 旧 uvicorn 被 SIGTERM 卡 connection drain ~90s | `systemctl restart dyrpa-server` |
 | 截图轮询拉 2MB PNG 卡 dashboard | 自动刷新 1.5s 一次堵带宽 | JS 节流 10s/次,手动走 "刷新" 按钮 |
 | `Shizuku.newProcess` IllegalAccessException | 13.x SDK 标了私有 | 反射调用,见 `shizuku/ShellExecutor.kt` |
+| SIM 卡纯蜂窝下 workflow 静默卡 100+ 秒,无报错无心跳 | Paho 默认 `maxInflight=10` + 全部消息 QoS 1,蜂窝 RTT 高 → PUBACK 慢 → inflight 满 → `client.publish()` 同步阻塞死锁 workflow 主线程 + step_progress daemon | `MqttClient.kt` 已抬 `maxInflight=100` + 高频事件降 QoS 0,详见 `BUGS.md` 第一条 |
+| `tap_xy/input_text/uiautomator dump` 偶报 `IllegalThreadStateException("process hasn't exited")` | Shizuku 的 `Process` 子类 `waitFor(timeout, TimeUnit)` 继承自基类 polls `exitValue()`,binder IPC 下返回不一致 → 假性 return true 后 `exitValue()` 又说没退出 | `ShellExecutor.run` 改用 waiter Thread + `Thread.join(timeoutMs+3s)` 上限,不走 timed `waitFor` |
+| 装新 APK 后 shizuku_server 突然没了 | `adb install` 走 `pm install` 路径会清 shell UID 子进程,即使 shizuku 之前在 TCP-stable 起的也带走 | 按 `RECONNECT_SOP.md`:拔 USB → 重连 TCP → 跑 `libshizuku.so` 重起;30 秒 |
 
 ---
 

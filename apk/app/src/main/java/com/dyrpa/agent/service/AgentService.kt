@@ -4,11 +4,13 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import com.dyrpa.agent.mqtt.MqttClient
+import com.dyrpa.agent.shizuku.ShellExecutor
 import com.dyrpa.agent.util.DeviceInfo
 import com.dyrpa.agent.workflow.Interpreter
 import org.json.JSONObject
@@ -36,6 +38,24 @@ class AgentService : Service() {
     private var currentBroker: String? = null
     private var currentDeviceId: String? = null
     private var heartbeatThread: Thread? = null
+    // Reference to the workflow execution thread so onControl/onTask can interrupt
+    // it when stop arrives or a new task preempts. Volatile because it's read from
+    // the MQTT callback thread and written from the workflow thread on completion.
+    @Volatile private var workflowThread: Thread? = null
+
+    // SharedPreferences-backed config: required for START_STICKY recovery.
+    // When OS kills the service (e.g. due to long shell wedges) and Android
+    // sticky-restarts us, the redelivered Intent is null — without these prefs
+    // we'd return START_NOT_STICKY immediately and "zombie" (service alive but
+    // no MQTT client + no Interpreter). See BUGS.md 2026-05-18 entry 2.
+    //
+    // Name "dyrpa" + keys "broker"/"device_id" MUST match MainActivity (it writes
+    // the same prefs when the user taps 启动). That way the service can recover
+    // from sticky restart even on a fresh install — as long as the user has
+    // configured + started once, prefs exist.
+    private val prefs by lazy {
+        getSharedPreferences("dyrpa", Context.MODE_PRIVATE)
+    }
 
     // Dedup state: on flaky cellular, MQTT QoS 1 broker re-delivers task messages
     // when a PUBACK is lost. Without dedup that spawns parallel workflow threads
@@ -53,8 +73,19 @@ class AgentService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val broker = intent?.getStringExtra(EXTRA_BROKER) ?: return START_NOT_STICKY
-        val deviceId = intent.getStringExtra(EXTRA_DEVICE_ID) ?: return START_NOT_STICKY
+        // intent may be null when Android sticky-restarts us after a kill. Fall
+        // back to last-known broker/deviceId from prefs so we recover automatically
+        // instead of sitting in a zombie state until the user re-opens MainActivity.
+        val broker = intent?.getStringExtra(EXTRA_BROKER)
+            ?: prefs.getString("broker", null)
+            ?: return START_NOT_STICKY
+        val deviceId = intent?.getStringExtra(EXTRA_DEVICE_ID)
+            ?: prefs.getString("device_id", null)
+            ?: return START_NOT_STICKY
+
+        // Persist current config so the sticky-restart path above can read them
+        // next time. Always write (cheap) — covers first run + user reconfig.
+        prefs.edit().putString("broker", broker).putString("device_id", deviceId).apply()
 
         startForeground(NOTIFY_ID, buildNotification("正在连接 broker…"))
 
@@ -89,6 +120,12 @@ class AgentService : Service() {
      *  when nothing's running (no-op on null fields). */
     private fun teardownAgent() {
         running = false
+        // Tell the workflow to bail and kill any in-flight shell so the worker
+        // thread can exit promptly instead of dragging the teardown out 15s+.
+        interpreter?.stopRequested = true
+        workflowThread?.interrupt()
+        ShellExecutor.killCurrent()
+        workflowThread = null
         heartbeatThread?.interrupt()
         heartbeatThread = null
         try { mqtt?.disconnect() } catch (_: Exception) {}
@@ -113,12 +150,29 @@ class AgentService : Service() {
         }.apply { isDaemon = true; name = "dyrpa-heartbeat"; start() }
 
     private fun onTask(taskJson: String) {
+        // Critical: this is the Paho callback thread. It MUST return ASAP and
+        // MUST NOT call client.publish() — both will corrupt Paho 3.x's internal
+        // state and cause subscribe-stalled-but-publish-still-works deadlock
+        // (the "ghost task" bug, see BUGS.md). Offload everything to a dispatcher.
         Log.i(TAG, "task received (${taskJson.length} bytes)")
+        Thread { handleTask(taskJson) }
+            .apply { isDaemon = true; name = "task-dispatcher" }
+            .start()
+    }
+
+    private fun handleTask(taskJson: String) {
         val taskId = peekTaskId(taskJson)
         if (taskId.isEmpty()) {
             Log.w(TAG, "task missing task_id, dropping")
             return
         }
+
+        // Phase 1 (inside lock): dedup check + remember oldThread to preempt.
+        // We DON'T claim activeTaskId yet — preempting needs to happen outside
+        // the lock (join() may sleep multiple seconds; we don't want to block
+        // other dispatcher threads while holding taskLock).
+        val toPreempt: Thread?
+        val preemptedTaskId: String?
         synchronized(taskLock) {
             if (recentTaskIds.containsKey(taskId)) {
                 // MQTT QoS 1 redelivery (broker didn't get our PUBACK in time).
@@ -126,25 +180,37 @@ class AgentService : Service() {
                 mqtt?.publishLog("[task] dedup ignored $taskId (already seen)", level = "warn")
                 return
             }
-            if (activeTaskId != null) {
-                // A different task arrived while one is running. Server's /run/workflow
-                // returns 409 for this on the API side, but be defensive in case of
-                // races or out-of-order delivery.
-                mqtt?.publishLog(
-                    "[task] busy with $activeTaskId, rejecting new task $taskId",
-                    level = "warn",
-                )
-                mqtt?.publishEvent("task_failed", taskId, mapOf("error" to "device busy"))
-                return
-            }
             recentTaskIds[taskId] = System.currentTimeMillis()
             while (recentTaskIds.size > MAX_RECENT_TASK_IDS) {
                 val oldest = recentTaskIds.keys.iterator().next()
                 recentTaskIds.remove(oldest)
             }
-            activeTaskId = taskId
+            toPreempt = if (activeTaskId != null) workflowThread else null
+            preemptedTaskId = activeTaskId
         }
-        Thread {
+
+        // Phase 2 (outside lock): if a previous workflow is still running, signal
+        // it to stop and wait briefly for it to unwind. Mirrors the user mental
+        // model "点开始 = 重新开始" — old run is replaced, not queued behind.
+        if (toPreempt != null) {
+            mqtt?.publishLog(
+                "[task] preempting previous task $preemptedTaskId for new task $taskId",
+                level = "warn",
+            )
+            interpreter?.stopRequested = true
+            toPreempt.interrupt()
+            ShellExecutor.killCurrent()
+            try { toPreempt.join(5_000) } catch (_: InterruptedException) {}
+            if (toPreempt.isAlive) {
+                mqtt?.publishLog(
+                    "[task] WARN: previous task $preemptedTaskId did not exit within 5s; starting $taskId anyway",
+                    level = "warn",
+                )
+            }
+        }
+
+        // Phase 3 (back inside lock): now claim activeTaskId for the new run.
+        val newThread = Thread {
             try {
                 interpreter?.execute(taskJson)
             } catch (e: Exception) {
@@ -152,10 +218,18 @@ class AgentService : Service() {
                 mqtt?.publishEvent("task_failed", taskId, mapOf("error" to (e.message ?: "unknown")))
             } finally {
                 synchronized(taskLock) {
-                    if (activeTaskId == taskId) activeTaskId = null
+                    if (activeTaskId == taskId) {
+                        activeTaskId = null
+                        workflowThread = null
+                    }
                 }
             }
-        }.start()
+        }.apply { name = "workflow-$taskId" }
+        synchronized(taskLock) {
+            activeTaskId = taskId
+            workflowThread = newThread
+        }
+        newThread.start()
     }
 
     private fun peekTaskId(taskJson: String): String =
@@ -163,9 +237,20 @@ class AgentService : Service() {
 
     private fun onControl(payload: String) {
         // payload format: {"cmd":"stop"}
+        // Critical: this runs on Paho's callback thread. We MUST NOT call
+        // client.publish() here — concurrent publish from the callback thread
+        // while the workflow thread is mid-publish (firing task_failed within
+        // ms of our interrupt) corrupts Paho 3.x state and stalls subscribe.
         if (payload.contains("\"stop\"")) {
             interpreter?.stopRequested = true
-            mqtt?.publishLog("[control] stop received", level = "warn")
+            workflowThread?.interrupt()
+            ShellExecutor.killCurrent()
+            Log.i(TAG, "control stop received; signal sent + shell killed")
+            // Offload the dashboard log line so the callback thread returns
+            // immediately. Daemon thread because it's fire-and-forget.
+            Thread {
+                mqtt?.publishLog("[control] stop received", level = "warn")
+            }.apply { isDaemon = true; name = "stop-log" }.start()
         }
     }
 

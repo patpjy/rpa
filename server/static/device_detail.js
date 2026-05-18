@@ -38,6 +38,11 @@ let savedOverrides = {};
 // User can still tap the 刷新 button for an instant fresh fetch.
 let lastAutoShotRefresh = 0;
 const AUTO_SHOT_REFRESH_MS = 10000;
+// After 点停止, lock out Start for a brief window so the phone has time to
+// actually unwind (workflow thread interrupt + shell kill, see AgentService).
+// Mirrors AgentService onTask preempt's 5s join + small buffer.
+let stopLockoutUntil = 0;
+const STOP_LOCKOUT_MS = 6000;
 
 // ---------------- helpers ----------------
 function appendLog(msg) {
@@ -120,8 +125,9 @@ async function refreshState() {
     els.elapsed.textContent = "未开始";
   }
 
-  els.btnInspect.disabled = running;
-  els.btnWorkflow.disabled = running;
+  const lockedOut = Date.now() < stopLockoutUntil;
+  els.btnInspect.disabled = running || lockedOut;
+  els.btnWorkflow.disabled = running || lockedOut;
   els.btnStop.disabled = !running;
 
   if (s.last_screenshot && s.last_screenshot !== els.screenshot.dataset.path) {
@@ -197,6 +203,13 @@ els.btnWorkflow.addEventListener("click", async () => {
 });
 
 els.btnStop.addEventListener("click", async () => {
+  // Lock out the start buttons for STOP_LOCKOUT_MS so user can't spam Start
+  // before phone has actually killed the current workflow + shell. Without
+  // this, every premature start dispatches a new task that gets preempted /
+  // queued, generating spam tasks (see BUGS.md re: stale pending tasks).
+  stopLockoutUntil = Date.now() + STOP_LOCKOUT_MS;
+  els.btnWorkflow.disabled = true;
+  els.btnInspect.disabled = true;
   await fetch(`${API}/run/stop`, { method: "POST" });
 });
 

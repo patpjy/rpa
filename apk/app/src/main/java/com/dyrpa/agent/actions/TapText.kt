@@ -13,7 +13,7 @@ class TapText : Action {
         val text = step.resolveValue(acx.workflow, acx.drafts)
         if (text.isEmpty()) throw RuntimeException("tap_text: empty value")
         val timeoutMs = (step.double("timeout", 8.0) * 1000).toLong()
-        val center = UiTreeFinder.findByText(text, timeoutMs)
+        val center = UiTreeFinder.findByText(text, timeoutMs, acx.stopCheck)
             ?: throw RuntimeException("tap_text: element not found: $text")
         val r = ShellExecutor.inputTap(center.first, center.second)
         if (!r.ok) throw RuntimeException("tap_text failed: ${r.stderr}")

@@ -5,6 +5,7 @@ import rikka.shizuku.Shizuku
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * All V9.1 actions reduce to shell commands; this wrapper runs them via Shizuku
@@ -33,6 +34,26 @@ object ShellExecutor {
     private fun newProcess(cmd: Array<String>): Process =
         newProcessMethod.invoke(null, cmd, null, null) as Process
 
+    // Exposed so the workflow's stop path (AgentService.onControl / onTask preempt)
+    // can SIGTERM+SIGKILL whatever shell is in-flight without waiting for its
+    // 8-15s timeout. Single-slot: workflows are serial (taskLock in AgentService),
+    // so at most one ShellExecutor.run() is active per device at any time.
+    private val currentProc = AtomicReference<Process?>(null)
+
+    /** External "kill the shell that's running RIGHT NOW" hook. Safe to call when
+     *  nothing's running (no-op). Spawns the kill -9 in a background thread so the
+     *  caller (typically MQTT callback) isn't blocked on Shizuku binder IPC. */
+    fun killCurrent() {
+        val proc = currentProc.getAndSet(null) ?: return
+        try { proc.destroy() } catch (_: Throwable) {}
+        Thread {
+            try {
+                Thread.sleep(800)
+                if (proc.isAlive) forceKill(proc, "killCurrent")
+            } catch (_: InterruptedException) {}
+        }.apply { isDaemon = true; name = "shell-killer" }.start()
+    }
+
     fun run(cmd: String, timeoutMs: Long = 8_000L): Result {
         val proc: Process = try {
             newProcess(arrayOf("sh", "-c", cmd))
@@ -40,6 +61,9 @@ object ShellExecutor {
             Log.e(TAG, "shell start failed: $cmd", e)
             return Result(-1, "", e.message ?: "exception")
         }
+        // Publish to the single-slot reference so AgentService.onControl("stop")
+        // or onTask preempt can SIGTERM+SIGKILL us without waiting for timeout.
+        currentProc.set(proc)
         // Escalation watchdog: SIGTERM first, then SIGKILL via a fresh Shizuku
         // shell if the child still won't die. `am broadcast` / `uiautomator dump`
         // can sit in kernel D-state and ignore SIGTERM forever; SIGKILL via
@@ -85,12 +109,29 @@ object ShellExecutor {
         // Hard ceiling: workflow thread bails after timeoutMs+3s even if the
         // child is wedged in D-state. timeoutMs is the soft watchdog start;
         // we add 3s for destroy() + kill -9 to take effect.
-        waiter.join(timeoutMs + 3_000)
+        try {
+            waiter.join(timeoutMs + 3_000)
+        } catch (e: InterruptedException) {
+            // Stop arrived while we were waiting on the shell. Kill the child
+            // synchronously (SIGTERM here, SIGKILL from forceKill below) so we
+            // don't leak a long-running shell after the workflow unwinds.
+            Log.w(TAG, "shell run interrupted by caller: $cmd")
+            try { proc.destroy() } catch (_: Throwable) {}
+            if (proc.isAlive) forceKill(proc, cmd)
+            watchdog.interrupt()
+            waiter.interrupt()
+            currentProc.compareAndSet(proc, null)
+            // Preserve the interrupt flag so caller's outer InterruptedException
+            // handling (Interpreter.runSection) still fires correctly.
+            Thread.currentThread().interrupt()
+            throw e
+        }
         watchdog.interrupt()
         // Don't block forever on the drain threads either — they're reading
         // from pipes of a potentially still-alive child.
         tOut.join(500)
         tErr.join(500)
+        currentProc.compareAndSet(proc, null)
         return if (exitCaptured.get()) {
             Result(exitCode.get(), stdout, stderr)
         } else {

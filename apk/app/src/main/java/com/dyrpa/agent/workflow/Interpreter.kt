@@ -77,7 +77,10 @@ class Interpreter(
             idx = runSection(task.taskId, submitSteps, idx, total, acx, "submit_search")
             var completed = 0
             for (i in 1..maxItems) {
-                if (stopRequested) break
+                // Stop signaled between iterations: throw rather than break so we
+                // hit the outer InterruptedException catch (which publishes
+                // task_failed("stopped")) instead of falling through to task_done.
+                if (stopRequested) throw InterruptedException("stopped before per_item $i")
                 mqtt.publishLog("[per_item] iteration $i/$maxItems", taskId = task.taskId)
                 try {
                     idx = runSection(task.taskId, perItemSteps, idx, total, acx, "per_item_$i")
@@ -88,6 +91,12 @@ class Interpreter(
                         task.taskId,
                         mapOf("completed" to completed, "total" to maxItems),
                     )
+                } catch (e: InterruptedException) {
+                    // Stop fired inside this iteration's steps. Don't do recover()
+                    // (more shell calls) — re-throw so the outer catch publishes
+                    // task_failed("stopped") and we exit cleanly.
+                    Thread.currentThread().interrupt()
+                    throw e
                 } catch (e: SkipCandidate) {
                     mqtt.publishLog("[per_item] skip: ${e.message}", level = "warn", taskId = task.taskId)
                     recover()
@@ -102,6 +111,13 @@ class Interpreter(
             }
             mqtt.publishEvent("task_done", task.taskId, mapOf("completed" to completed, "attempted" to maxItems))
         } catch (e: InterruptedException) {
+            // Clear the interrupt flag BEFORE publishing — Paho 3.x's internal
+            // locks check Thread.interrupted() and will throw InterruptedException
+            // wrapped in MqttException if we publish from an interrupted thread,
+            // routing the task_failed event into the pendingQueue (which never
+            // drains without a reconnect → dashboard never sees task_failed →
+            // server-side state diverges from phone-side state).
+            Thread.interrupted()
             mqtt.publishEvent("task_failed", task.taskId, mapOf("error" to "stopped"))
         } catch (e: WorkflowStepException) {
             // Rich failure: forensics already captured inside runSection. Surface step context to server.
@@ -233,6 +249,15 @@ class Interpreter(
                     taskId,
                     mapOf("current" to i, "total" to total, "type" to step.type),
                 )
+            } catch (e: InterruptedException) {
+                // Stop signal landed during this step. SKIP all forensics — they
+                // re-trigger shell calls (uiautomator dump, screencap) we already
+                // killed via ShellExecutor.killCurrent(). Just clean up the
+                // heartbeat and unwind. Caller's outer InterruptedException catch
+                // publishes task_failed("stopped").
+                progressTimer.interrupt()
+                Thread.currentThread().interrupt()
+                throw e
             } catch (e: SkipCandidate) {
                 progressTimer.interrupt()
                 throw e

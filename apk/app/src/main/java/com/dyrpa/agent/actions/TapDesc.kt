@@ -16,7 +16,7 @@ class TapDesc : Action {
         // so 3s only allows ~1 retry. V9.1's uiautomator2 was ~300ms so 3s gave it
         // ~7 retries. Scale up to match the slower shell-fork dump cadence.
         val timeoutMs = (step.double("timeout", 8.0) * 1000).toLong()
-        val center = UiTreeFinder.findByDesc(desc, timeoutMs)
+        val center = UiTreeFinder.findByDesc(desc, timeoutMs, acx.stopCheck)
             ?: throw RuntimeException("tap_desc: element not found: $desc")
         val r = ShellExecutor.inputTap(center.first, center.second)
         if (!r.ok) throw RuntimeException("tap_desc failed: ${r.stderr}")

@@ -24,8 +24,8 @@ class SkipIfExists : Action {
             mqtt.publishLog("[skip_if_exists] template '$template' check not supported in MVP, falling back to text/desc", level = "warn")
         }
 
-        val found = (targetText.isNotEmpty() && UiTreeFinder.findByText(targetText, timeoutMs) != null) ||
-                (targetDesc.isNotEmpty() && UiTreeFinder.findByDesc(targetDesc, timeoutMs) != null)
+        val found = (targetText.isNotEmpty() && UiTreeFinder.findByText(targetText, timeoutMs, acx.stopCheck) != null) ||
+                (targetDesc.isNotEmpty() && UiTreeFinder.findByDesc(targetDesc, timeoutMs, acx.stopCheck) != null)
         if (found) {
             mqtt.publishLog("[skip_if_exists] $reason", level = "warn")
             throw SkipCandidate(reason)

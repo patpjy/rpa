@@ -23,8 +23,8 @@ class TapRelativeToElement : Action {
         val timeoutMs = (step.double("timeout", 2.0) * 1000).toLong()
 
         val center = when {
-            anchorText.isNotEmpty() -> UiTreeFinder.findByText(anchorText, timeoutMs)
-            anchorDesc.isNotEmpty() -> UiTreeFinder.findByDesc(anchorDesc, timeoutMs)
+            anchorText.isNotEmpty() -> UiTreeFinder.findByText(anchorText, timeoutMs, acx.stopCheck)
+            anchorDesc.isNotEmpty() -> UiTreeFinder.findByDesc(anchorDesc, timeoutMs, acx.stopCheck)
             else -> throw RuntimeException("tap_relative_to_element: anchor_text or anchor_desc required")
         } ?: throw RuntimeException("tap_relative_to_element: anchor not found: ${anchorText.ifEmpty { anchorDesc }}")
 

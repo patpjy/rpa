@@ -19,8 +19,8 @@ class TapXyIfMissing : Action {
         val targetText = step.str("text")
         val targetDesc = step.str("desc")
         val timeoutMs = (step.double("timeout", 1.0) * 1000).toLong()
-        val found = (targetText.isNotEmpty() && UiTreeFinder.findByText(targetText, timeoutMs) != null) ||
-                (targetDesc.isNotEmpty() && UiTreeFinder.findByDesc(targetDesc, timeoutMs) != null)
+        val found = (targetText.isNotEmpty() && UiTreeFinder.findByText(targetText, timeoutMs, acx.stopCheck) != null) ||
+                (targetDesc.isNotEmpty() && UiTreeFinder.findByDesc(targetDesc, timeoutMs, acx.stopCheck) != null)
         if (found) {
             mqtt.publishLog("[tap_xy_if_missing] '${targetText.ifEmpty { targetDesc }}' present → skip fallback")
             return

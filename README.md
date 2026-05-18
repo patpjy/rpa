@@ -17,7 +17,7 @@ YAML 不动,改的是执行器位置(PC ↔ 手机自身)。
 | **Phase 1** 公网服务器 | 🟢 已部署 | 腾讯云 VPS 81.69.43.246,FastAPI + Mosquitto + systemd |
 | **Phase 2** APK + 17 action | 🟢 完成 | Kotlin,17/17 actions(`tap_image` / `image_exists` 为 stub,等 OpenCV)|
 | **Phase 3** 无 USB 持久化 | 🟢 实证 | 2026-05-15 honor50-01 拔 USB + 关 WiFi 后 Shizuku 持续运行,workflow 远程可控 |
-| **Phase 4** 工作流真机调优 | 🟢 实证 | 2026-05-18 candidate 3/3 跑通 WiFi + SIM 卡纯蜂窝双场景;MQTT QoS 分级 + `maxInflight=100` 治 SIM 弱网卡死,ShellExecutor watchdog 替换 buggy `waitFor(timeout)`,step_progress 心跳 + 5min stale watchdog 全套韧性上线(详见 `BUGS.md`)|
+| **Phase 4** 工作流真机调优 | 🟢 实证 | 2026-05-18 candidate 3/3 跑通 WiFi + SIM 卡纯蜂窝双场景;MQTT QoS 分级 + `maxInflight=100` 治 SIM 弱网卡死,ShellExecutor watchdog 替换 buggy `waitFor(timeout)`,step_progress 心跳 + 5min stale watchdog 全套韧性上线;**Stop/Start 三层并修**:`Thread.interrupt()` + `ShellExecutor.killCurrent()` 让停止 1-2s 真停(原 15-60s),SharedPreferences 兜底让 service sticky 重启自愈,Paho callback thread 解耦修 subscribe stalled 死锁(详见 `BUGS.md`)|
 | **Phase 5** 多机并发 + 风控 + TLS | ⚪ 未启 | 5-10 台并发实测、broker TLS+ACL、包名/痕迹隐藏 |
 
 整体计划草案: `~/.claude/plans/plan-virtual-brooks.md`
@@ -342,6 +342,32 @@ val qos = if (critical) 1 else 0   // 高频事件 (log/step_*) 走 QoS 0,fire-a
 - **`apk/.../mqtt/MqttClient.kt`**:`pendingQueue` 上限 100,`MqttCallbackExtended.connectComplete(reconnect=true)` 时 drain 重发,弱网断点不丢 critical 事件
 - **`apk/.../shizuku/ShellExecutor.kt`**:waiter Thread + `join(timeoutMs+3s)` 替换 Shizuku Process 子类下 buggy 的 `proc.waitFor(timeout, TimeUnit)`(那个会假性 return true 然后 `exitValue()` 抛 `IllegalThreadStateException("process hasn't exited")`)
 
+### Stop / Start 三层强制(2026-05-18)
+
+旧版本 stop 只设 `stopRequested` 标志,workflow 主线程卡在 ShellExecutor 的 `waiter.join(15s)` / UiTreeFinder 的 polling / forensics 上传里完全不响应,实测延迟 15-60 秒才停。修后 1-2 秒真停。
+
+```
+点停止 / 抢占启动 → 三发齐打:
+
+  ┌──────────────────────────────────────────┐
+  │ 1. interpreter.stopRequested = true       │  协作式(原)— Interpreter 主循环间隙看
+  │ 2. workflowThread.interrupt()             │  唤醒 Thread.sleep / Process.waitFor
+  │ 3. ShellExecutor.killCurrent()            │  SIGTERM in-flight shell → 800ms 后 SIGKILL
+  └──────────────────────────────────────────┘
+                    │
+                    ▼
+  Interpreter.runSection / runWorkflow catch InterruptedException
+    → Thread.interrupted() 清 flag(避免 Paho lockInterruptibly 卡)
+    → publish task_failed("stopped")
+    → SKIP forensics / SKIP recover(那些都是 shell 调用,在 stop 路径上跑只拖延)
+```
+
+**Paho callback 线程必须神圣**:`AgentService.onTask` 和 `onControl` 全部内容移到 dispatcher / daemon 线程,callback 线程只做无 IO 的标志位 + interrupt + killCurrent。**不准从 callback 线程 publish 或 join** — Paho 3.x 在 callback re-entrancy 下会进入 "publish 还活、subscribe 流水线死" 的不可恢复状态(详见 `BUGS.md` 2026-05-18 三层级联条)。
+
+**Service sticky 重启自愈**:`AgentService.onStartCommand` 读 SharedPreferences `"dyrpa"` 的 `broker` + `device_id` 兜底,OS 杀掉 service 后 START_STICKY 重启拿到 null intent 时不再僵尸,自己重建 MqttClient。
+
+**Start 抢占语义**:`onTask` 看到 `activeTaskId != null` 不再 reject,改成 preempt(stop 旧的 → `join(5s)` → 启新的)— 用户心智模型"点开始 = 重新开始"对齐;`device_detail.js` 配套点停止后 disable 启动按钮 6 秒。
+
 ### ShellExecutor 并发排空 stdout/stderr(pipe 死锁修复)
 
 ```kotlin
@@ -420,6 +446,9 @@ drafts:
 | SIM 卡纯蜂窝下 workflow 静默卡 100+ 秒,无报错无心跳 | Paho 默认 `maxInflight=10` + 全部消息 QoS 1,蜂窝 RTT 高 → PUBACK 慢 → inflight 满 → `client.publish()` 同步阻塞死锁 workflow 主线程 + step_progress daemon | `MqttClient.kt` 已抬 `maxInflight=100` + 高频事件降 QoS 0,详见 `BUGS.md` 第一条 |
 | `tap_xy/input_text/uiautomator dump` 偶报 `IllegalThreadStateException("process hasn't exited")` | Shizuku 的 `Process` 子类 `waitFor(timeout, TimeUnit)` 继承自基类 polls `exitValue()`,binder IPC 下返回不一致 → 假性 return true 后 `exitValue()` 又说没退出 | `ShellExecutor.run` 改用 waiter Thread + `Thread.join(timeoutMs+3s)` 上限,不走 timed `waitFor` |
 | 走 **USB** 装新 APK 后 shizuku_server 没了 | `adb install` 通过 USB transport 触发 adbd 状态变化,清理钩子杀 shell UID 子进程(纯 TCP install 没事,2026-05-18 honor50-02 实证)| 1) 优先选项:**蜂窝独立后所有装 APK 都走 TCP**:`adb -s <wifi_ip>:5555 install -r ...`,shizuku 不死。2) 若已走 USB 死了:按 `RECONNECT_SOP.md` 拔 USB → 重连 TCP → libshizuku.so 重起 |
+| 点停止后 workflow 仍跑 15-60 秒才停,期间 dashboard 看到 step_progress 还在累计 | stop 信号只设了 `stopRequested` 标志,workflow 主线程卡在 ShellExecutor 的 `waiter.join(15s)` / UiTreeFinder 的 polling loop / forensics 上传里,这些路径都不响应 flag | `Interpreter` catch InterruptedException 跳过 forensics + recover;`AgentService.onControl` 加 `workflowThread.interrupt()` + `ShellExecutor.killCurrent()`;详见 `BUGS.md` 2026-05-18 三层级联条 |
+| 点停止后点开始,server `task dispatched` 但 phone 端没动静,任务永远 pending | Service 被 OS 杀过(workflow 长卡触发 LMK),`START_STICKY` 重启拿到 null intent → `onStartCommand` 第一行 `?: return START_NOT_STICKY` 直接 bail → service 在跑但 `mqtt`/`interpreter` 都 null | `AgentService` 读 SharedPreferences `"dyrpa"` 的 broker/device_id 兜底重建 MqttClient |
+| stop 后立刻 start 没反应,phone 还在发心跳但收不到 task / control(单向死) | Paho 3.x callback 线程 re-entrancy bug:`onControl` 从 callback 线程 publish + workflow 线程同时 publish task_failed,两个并发 publish 撞乱 Paho 内部 inflight 状态 → subscribe 流水线卡死(publish 还活) | `onTask` / `onControl` **全部**移到 dispatcher / daemon 线程,callback 线程只做 set flag + interrupt + killCurrent;`Interpreter` catch InterruptedException 在 publish 前先 `Thread.interrupted()` 清 flag |
 
 ---
 

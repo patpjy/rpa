@@ -4,6 +4,186 @@
 
 ---
 
+## 2026-05-18 · Stop/Start 失效三层级联 — workflow 不停 / 服务僵尸 / Paho subscribe 停摆
+
+### 现象
+
+群控架构上线后第一次实战时,用户反复点"停止"和"启动 workflow":
+
+1. **停止不停**:dashboard 点停止后 phone 端 workflow 仍跑 15-30 秒(uiautomator dump 跑完才停)
+2. **重启没反应**:停止后再点"启动 workflow",dashboard 显示 `[server] task X dispatched` 但**之后任何 phone 端日志都没有**。连点 9 次,server 接受 9 个 task,phone 一个都没接到。
+3. **心跳停止 → "在线"假象**:心跳栏停在某个旧时间(180s 内 dashboard 还显示绿点),其实手机端 service 已经死了
+
+### 关键证据
+
+```
+Server SQLite (`dyrpa.db`):
+b000da11 honor50-02 workflow failed   prog=0/3 err='stopped by user'   ← 原始任务(被 force-fail)
+a9a0a615 honor50-02 workflow pending  prog=0/0 err=''                  ← 之后 11 次 dispatch 全部 stuck pending
+46279813 honor50-02 workflow pending  prog=0/0 err=''
+... (9 more pending)
+
+Mosquitto broker log:
+1779075973 (11:46:13)  honor50-02 connected as dyrpa-honor50-02-1779075973417
+1779076038 (11:47:18)  closed its connection      ← stop 后 18 秒,phone 端 MQTT 死了
+                                                  ← 之后 broker 视角再没有任何 honor50-02 重连事件
+
+Phone-side(第二轮 v1 fix 后的现场):
+[control] stop received                ← onControl 触发,publishLog 从 Paho callback 线程发出
+[tap_xy] (0.2528, 0.3603) → (273, 843) ← 同一时刻 workflow 线程 step 10 完成,publishLog 也从那边发出
+[step_progress] step_index=10 elapsed_ms=5001
+[server] task 1086c073ec15 dispatched  ← 再次启动
+[彻底没下文]                            ← phone subscribe 死,publish 还活
+```
+
+最致命的取证手段:**broker 端 `mosquitto_sub` 订阅 phone 的 event topic 60 秒**,确认 phone 在持续 publish heartbeat(battery 数值在变),但 `mosquitto_pub` 推 control 到 phone 完全无反应 → **phone 的 MQTT 是单向死的**(publish OK,subscribe 死)。
+
+### 根因 — 三层级联
+
+#### 层 1:Stop 是"协作式"的,workflow 主线程有 5 处不响应 stopRequested 标志的阻塞点
+
+| 阻塞点 | 文件:行 | 最坏卡多久 |
+|---|---|---|
+| `ShellExecutor.run` 的 `waiter.join(timeoutMs+3s)` | `shizuku/ShellExecutor.kt:88` | 18s(uiautomator dump = 15s + 3s grace) |
+| `UiTreeFinder.findBy` 内部 while loop | `util/UiTreeFinder.kt:26-32` | 8s 外层(单次 uiDump 可能 15s) |
+| `captureUiXmlOnly` 失败后再 uiDump | `workflow/Interpreter.kt:151` | 15s |
+| `captureFailure` screencap + 2 次 uiDump + HTTP 上传 | `workflow/Interpreter.kt:170-181` | 20-30s |
+| `recover()` back×3 + swipe(都走 shell) | `workflow/Interpreter.kt:127-134` | ~6s |
+
+`stopRequested` 标志只在 `runWorkflow` for-loop 和 `runSection` 的步骤之间被检查,这之间的所有阻塞调用对 stop 信号完全无感。最坏情况 stop 信号被设置后 60-80s workflow 主线程才能爬到下一个 stop 检查点。
+
+#### 层 2:Service lifecycle 漏洞 — START_STICKY 重启拿到 null intent → 僵尸服务
+
+`AgentService.onStartCommand` 老逻辑:
+```kotlin
+val broker = intent?.getStringExtra(EXTRA_BROKER) ?: return START_NOT_STICKY
+val deviceId = intent.getStringExtra(EXTRA_DEVICE_ID) ?: return START_NOT_STICKY
+```
+
+故障路径:
+1. workflow 卡在 step 10 + forensics 上 30+ 秒
+2. HONOR/MagicOS 觉得 service 不响应,杀掉(即使 PARTIAL_WAKE_LOCK + 前台 service 也救不了)
+3. `onDestroy` → `teardownAgent` → `mqtt.disconnect()`(broker 看到 TCP FIN — 就是上面 11:47:18 那次 close)
+4. Android `START_STICKY` 重启 service,但**`Intent` 是 null**(START_STICKY 不重投原 intent,只有 `START_REDELIVER_INTENT` 才会)
+5. `onStartCommand` 第一行 `?: return START_NOT_STICKY` → 立刻返回,啥也不干
+6. **Service 在跑(`isForeground=true`,wakelock 持有)但 `mqtt`/`interpreter` 都是 null**
+7. Heartbeats 停,新 task 全部塞 broker 离线队列里没人取
+
+#### 层 3:Paho 3.x callback thread re-entrancy — publish 从 callback 线程发,subscribe 死
+
+层 1 修完后 stop 真的快了(1-2s 内 task_failed("stopped") 发出),反而触发了**第三层 bug**:
+
+- `onControl` 在 Paho callback 线程里运行,旧代码直接 `mqtt?.publishLog("[control] stop received")` —— 从 callback 线程 publish
+- 同一时刻 workflow 线程被 `Thread.interrupt()` 唤醒,在 `catch (InterruptedException)` 里也 publish `task_failed("stopped")`(QoS 1)
+- **两个 publish 几乎同时从不同线程触发,其中一个来自 Paho 自己的 callback 线程** — Paho 3.x 的著名 re-entrancy 雷区
+- 加之 workflow 线程的 interrupt flag 还没清,`client.publish(QoS 1)` 内部 `lockInterruptibly` 撞到 flag → 抛 MqttException → task_failed 进 `pendingQueue` → **永远不 drain**(没有 reconnect 触发)
+- Paho 客户端进入"publish 还能用、subscribe 流水线烂掉"的奇怪状态。Heartbeat 还能发,但 broker 推下来的 task / control 一律收不到
+
+旧代码不暴露这个 bug 是因为层 1 让 workflow 线程的 task_failed publish 跟 onControl 的 publishLog 错开了 15+ 秒,Paho 来得及"消化"。新代码 stop 太快反而暴露了 Paho 这个底层 bug。
+
+### 修复(2026-05-18 三层并修)
+
+#### 层 1 — Stop 真停
+
+- **`ShellExecutor.kt`**:`currentProc: AtomicReference<Process?>` 暴露当前 in-flight shell + `killCurrent()` SIGTERM→SIGKILL 接口;`run()` 的 `waiter.join` 包 try/catch InterruptedException,中断时立刻 destroy proc + 重抛
+- **`UiTreeFinder.kt`**:所有 `findBy*` 方法加可选 `stopCheck: () -> Boolean` 参数,polling loop 每次 uiDump 前后检查,真时抛 InterruptedException
+- **7 个 Action 文件**(`TapText/TapDesc/TapResourceId/TapXyIfMissing/TapRelativeToElement/SkipIfExists/SkipIfNotExists`):调 UiTreeFinder 时传 `acx.stopCheck`
+- **`Interpreter.kt`**:
+  - `runSection` 的 catch 顺序加 `catch (InterruptedException)` 在最前,**跳过 forensics + recover** 直接重抛
+  - `runWorkflow` 的 per_item for-loop 内 try 块同样优先抓 InterruptedException
+  - for-loop 顶 `if (stopRequested) break` 改成 `if (stopRequested) throw InterruptedException(...)` — 避免 break 跳出后 fall through 到 `task_done` publish
+
+#### 层 2 — Service 自愈
+
+`AgentService.onStartCommand` 改成读 SharedPreferences 兜底:
+```kotlin
+val broker = intent?.getStringExtra(EXTRA_BROKER)
+    ?: prefs.getString("broker", null)
+    ?: return START_NOT_STICKY
+val deviceId = intent?.getStringExtra(EXTRA_DEVICE_ID)
+    ?: prefs.getString("device_id", null)
+    ?: return START_NOT_STICKY
+prefs.edit().putString("broker", broker).putString("device_id", deviceId).apply()
+```
+
+**prefs 名字必须是 `"dyrpa"`**(跟 MainActivity 写入的同名),不能写成 `"dyrpa-agent"` 之类 — 这是踩过的坑(第一版改 `"dyrpa-agent"` 时 sticky 重启读不到、bug 没被掩盖反而曝光了)。
+
+`teardownAgent` 也补上 `workflowThread?.interrupt() + ShellExecutor.killCurrent()`,service 拆掉时 workflow 不会拖延 15s+ 才退出。
+
+#### 层 3 — Paho callback thread 解耦
+
+`AgentService.onTask` 整体移到 dispatcher 线程:
+```kotlin
+private fun onTask(taskJson: String) {
+    // 关键:Paho callback 线程必须立刻返回,不能 publish、不能 join
+    Log.i(TAG, "task received (${taskJson.length} bytes)")
+    Thread { handleTask(taskJson) }
+        .apply { isDaemon = true; name = "task-dispatcher" }
+        .start()
+}
+```
+
+`AgentService.onControl` 同理,publishLog 移到 daemon 线程:
+```kotlin
+private fun onControl(payload: String) {
+    if (payload.contains("\"stop\"")) {
+        interpreter?.stopRequested = true
+        workflowThread?.interrupt()
+        ShellExecutor.killCurrent()
+        Log.i(TAG, "control stop received; signal sent + shell killed")
+        Thread { mqtt?.publishLog("[control] stop received", level = "warn") }
+            .apply { isDaemon = true; name = "stop-log" }.start()
+    }
+}
+```
+
+`Interpreter.runWorkflow` 的 `catch (InterruptedException)` 第一行加 `Thread.interrupted()` 清 flag,**然后**再 publish task_failed:
+```kotlin
+} catch (e: InterruptedException) {
+    Thread.interrupted()  // 清 flag,避免 Paho lockInterruptibly 撞到
+    mqtt.publishEvent("task_failed", task.taskId, mapOf("error" to "stopped"))
+}
+```
+
+#### Bonus — Start 抢占 + Dashboard lockout
+
+- `onTask` 看到 `activeTaskId != null` 时不再"busy reject",改成 **preempt**:设 stopRequested → interrupt 旧 thread → killCurrent → `join(5_000)` 等旧 workflow 退出 → claim 新 task。语义对齐用户心智模型"点开始 = 重新开始"
+- `device_detail.js`:点停止后**禁用启动按钮 6 秒**(`STOP_LOCKOUT_MS`),给 phone 端时间完成 stop 流程,避免用户在 phone 还没清干净时 spam start
+
+### 验证(2026-05-18 v2 实证)
+
+| 测试 | 旧版本 | v1 fix(只修层 1) | v2 fix(三层并修) |
+|---|---|---|---|
+| stop → task ended 延迟 | 15-60s | **1-2s** ✅ | **1-2s** ✅ |
+| stop 后立刻 start | 9 次 dispatch 全 stuck pending | 同样卡 pending(Paho subscribe 死) | **新 task 立刻接管** ✅ |
+| Service 被 OS 杀后 | 永久僵尸,需手动开 app | 同 | **sticky 重启自愈,prefs 兜底** ✅ |
+| task_failed 错误信息 | `"stopped by user"`(server force-fail,phone 未真停) | `"stopped"`(phone 干净停止) | `"stopped"` |
+
+### 关键不变量(未来改 AgentService / Interpreter 时务必遵守)
+
+1. **Paho callback 线程是神圣的**:`onTask` / `onControl` 等 `MqttCallback` 方法**不准 publish、不准 join、不准任何 IO**。所有工作 offload 到 dispatcher / daemon 线程。Paho 3.x 对 callback 线程的 reentrancy 没有 watchdog,违反约定会进入"subscribe 死、publish 活"的不可恢复状态
+2. **Stop 必须三层都打**:`stopRequested` 标志(协作式)+ `Thread.interrupt()`(唤醒 Thread.sleep / Process.waitFor)+ `ShellExecutor.killCurrent()`(SIGKILL in-flight shell)。任何单独一种都救不了
+3. **catch InterruptedException 在 publish 之前必须 `Thread.interrupted()` 清 flag**:否则 Paho 内部 `lockInterruptibly` 会撞到 flag → MqttException → 关键事件进 pendingQueue 永远不发出
+4. **`START_STICKY` 的 Service 必须能从 null intent 重启自愈**:用 SharedPreferences 持久化关键配置,key 名要跟 MainActivity 写入的对齐(本项目是 `"dyrpa"` + `"broker"`/`"device_id"`)
+5. **Stop 路径 SKIP forensics**:catch InterruptedException 直接重抛,不要触发 captureFailure / captureUiXmlOnly / recover —— 这些都是 shell 调用,在中断路径里跑只会拖延 stop + 触发 Paho 写入风暴
+
+### Commits
+
+- `dfb7e30` fix(mqtt): SIM 弱网根治 ← stop 卡 15+s 的根源代码已在此版本
+- 后续 commit(本次):fix(workflow): stop 真停 + service 自愈 + Paho callback 解耦
+
+### 引用
+
+- `apk/app/src/main/java/com/dyrpa/agent/service/AgentService.kt`
+- `apk/app/src/main/java/com/dyrpa/agent/workflow/Interpreter.kt`
+- `apk/app/src/main/java/com/dyrpa/agent/shizuku/ShellExecutor.kt`
+- `apk/app/src/main/java/com/dyrpa/agent/util/UiTreeFinder.kt`
+- `apk/app/src/main/java/com/dyrpa/agent/actions/{Tap,Skip}*.kt`
+- `server/static/device_detail.js`
+- Paho callback re-entrancy 讨论:[Paho Java client thread-safety 文档](https://www.eclipse.org/paho/files/javadoc/org/eclipse/paho/client/mqttv3/MqttCallback.html)
+
+---
+
 ## 2026-05-18 · AgentService 一次性 mqtt init 守卫:改 broker / device_id 不生效
 
 ### 现象

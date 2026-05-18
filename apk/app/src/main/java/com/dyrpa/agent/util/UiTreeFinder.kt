@@ -12,22 +12,32 @@ object UiTreeFinder {
 
     private val BOUNDS_RE = Regex("""bounds="\[(\d+),(\d+)]\[(\d+),(\d+)]"""")
 
-    fun findByText(text: String, timeoutMs: Long): Pair<Int, Int>? =
-        findBy("text", text, timeoutMs)
+    fun findByText(text: String, timeoutMs: Long, stopCheck: () -> Boolean = { false }): Pair<Int, Int>? =
+        findBy("text", text, timeoutMs, stopCheck)
 
-    fun findByDesc(desc: String, timeoutMs: Long): Pair<Int, Int>? =
-        findBy("content-desc", desc, timeoutMs)
+    fun findByDesc(desc: String, timeoutMs: Long, stopCheck: () -> Boolean = { false }): Pair<Int, Int>? =
+        findBy("content-desc", desc, timeoutMs, stopCheck)
 
-    fun findByResourceId(rid: String, timeoutMs: Long): Pair<Int, Int>? =
-        findBy("resource-id", rid, timeoutMs)
+    fun findByResourceId(rid: String, timeoutMs: Long, stopCheck: () -> Boolean = { false }): Pair<Int, Int>? =
+        findBy("resource-id", rid, timeoutMs, stopCheck)
 
-    private fun findBy(attr: String, value: String, timeoutMs: Long): Pair<Int, Int>? {
+    /** `stopCheck` is polled before each uiautomator dump and again before each
+     *  inter-poll sleep. Returning true throws InterruptedException so callers
+     *  unwind immediately rather than wait out the outer timeoutMs. */
+    private fun findBy(
+        attr: String,
+        value: String,
+        timeoutMs: Long,
+        stopCheck: () -> Boolean = { false },
+    ): Pair<Int, Int>? {
         val start = System.currentTimeMillis()
         while (true) {
+            if (stopCheck()) throw InterruptedException("stopped during findBy($attr=$value)")
             val xml = ShellExecutor.uiDump().takeIf { it.ok }?.stdout.orEmpty()
             val center = parseCenter(xml, attr, value)
             if (center != null) return center
             if (System.currentTimeMillis() - start > timeoutMs) return null
+            if (stopCheck()) throw InterruptedException("stopped during findBy($attr=$value)")
             Thread.sleep(300)
         }
     }

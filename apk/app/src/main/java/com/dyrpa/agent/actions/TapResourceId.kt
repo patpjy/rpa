@@ -13,7 +13,7 @@ class TapResourceId : Action {
         val rid = step.resolveValue(acx.workflow, acx.drafts)
         if (rid.isEmpty()) throw RuntimeException("tap_resource_id: empty value")
         val timeoutMs = (step.double("timeout", 8.0) * 1000).toLong()
-        val center = UiTreeFinder.findByResourceId(rid, timeoutMs)
+        val center = UiTreeFinder.findByResourceId(rid, timeoutMs, acx.stopCheck)
             ?: throw RuntimeException("tap_resource_id: element not found: $rid")
         val r = ShellExecutor.inputTap(center.first, center.second)
         if (!r.ok) throw RuntimeException("tap_resource_id failed: ${r.stderr}")

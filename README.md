@@ -95,7 +95,11 @@ V9.1 单机                                 群控架构
 - USB 在的时候启 shizuku,拔 USB 100% 必死(2 次复现,第二次还加了 nohup setsid 也救不回来)
 - 先拔 USB 让 adbd 进 TCP-only 稳态后再启 shizuku → 多次拔插 USB / 关 WiFi / 切蜂窝都不死
 
-**⚠ 2026-05-18 补丁**:**即使 shizuku 在 TCP-stable 状态启动,后续 `adb install` 仍会带它一起死**。`pm install` 内部走 shell UID 路径会清掉所有 shell UID 子进程,shizuku_server 一并被收。结论:**装新 APK = 重新 bootstrap shizuku**,按 `RECONNECT_SOP.md` 30 秒救回(USB-stable 起 → 立刻拔 USB → TCP 起 shizuku)。
+**⚠ 2026-05-18 补丁(再次修正)**:决定 shizuku 死活的 trigger 是 **USB transport 状态变化**,**不是** `pm install` 本身。证据:
+- **USB 在 + `adb install`** → 杀 shizuku(USB transport 活跃 → adbd 状态变化 → 清理钩子触发)
+- **USB 拔 + TCP `adb -s <ip>:5555 install`** → ✅ shizuku 不动(2026-05-18 honor50-02 实证,TCP-only install 后 shizuku_server PID 不变)
+
+所以最佳实践:**蜂窝独立后所有 APK 更新都走 TCP `adb -s <wifi_ip>:5555 install`,不再插 USB,shizuku 永不死**。只有手机重启 / 关机后第一次才需要 USB bootstrap(因为重启后 `adb tcpip 5555` 属性丢失)。
 
 ---
 
@@ -415,7 +419,7 @@ drafts:
 | `Shizuku.newProcess` IllegalAccessException | 13.x SDK 标了私有 | 反射调用,见 `shizuku/ShellExecutor.kt` |
 | SIM 卡纯蜂窝下 workflow 静默卡 100+ 秒,无报错无心跳 | Paho 默认 `maxInflight=10` + 全部消息 QoS 1,蜂窝 RTT 高 → PUBACK 慢 → inflight 满 → `client.publish()` 同步阻塞死锁 workflow 主线程 + step_progress daemon | `MqttClient.kt` 已抬 `maxInflight=100` + 高频事件降 QoS 0,详见 `BUGS.md` 第一条 |
 | `tap_xy/input_text/uiautomator dump` 偶报 `IllegalThreadStateException("process hasn't exited")` | Shizuku 的 `Process` 子类 `waitFor(timeout, TimeUnit)` 继承自基类 polls `exitValue()`,binder IPC 下返回不一致 → 假性 return true 后 `exitValue()` 又说没退出 | `ShellExecutor.run` 改用 waiter Thread + `Thread.join(timeoutMs+3s)` 上限,不走 timed `waitFor` |
-| 装新 APK 后 shizuku_server 突然没了 | `adb install` 走 `pm install` 路径会清 shell UID 子进程,即使 shizuku 之前在 TCP-stable 起的也带走 | 按 `RECONNECT_SOP.md`:拔 USB → 重连 TCP → 跑 `libshizuku.so` 重起;30 秒 |
+| 走 **USB** 装新 APK 后 shizuku_server 没了 | `adb install` 通过 USB transport 触发 adbd 状态变化,清理钩子杀 shell UID 子进程(纯 TCP install 没事,2026-05-18 honor50-02 实证)| 1) 优先选项:**蜂窝独立后所有装 APK 都走 TCP**:`adb -s <wifi_ip>:5555 install -r ...`,shizuku 不死。2) 若已走 USB 死了:按 `RECONNECT_SOP.md` 拔 USB → 重连 TCP → libshizuku.so 重起 |
 
 ---
 

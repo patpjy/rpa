@@ -4,6 +4,135 @@
 
 ---
 
+## 2026-05-18 · AgentService 一次性 mqtt init 守卫:改 broker / device_id 不生效
+
+### 现象
+
+新机首次装机时,broker URL **填错(或保留 hint 占位符)**点了启动 → 前台通知显示"正在连接 broker…"卡死,dashboard 看不到设备。回主界面改对 broker URL → 再点启动 → 通知**仍然**卡在"正在连接 broker…"。
+
+dyrpa-agent UI **没有任何错误提示**,以为已经连上;但 server 端 broker log **完全没有这个 device_id 的连接记录**(超过 12 分钟)。
+
+### 关键证据
+
+通过 TCP adb 拉新机现场:
+
+```bash
+# 1. SharedPrefs 里 broker URL 已经是对的(字符级无误)
+$ adb shell 'run-as com.dyrpa.agent cat /data/data/com.dyrpa.agent/shared_prefs/dyrpa.xml'
+<string name="broker">tcp://81.69.43.246:1883</string>     # ← 对的
+
+# 2. 但 dyrpa 进程 socket fd 数 = 0(根本没建 TCP 连接)
+$ adb shell 'ls -la /proc/<PID>/fd | grep socket | wc -l'
+0
+
+# 3. 前台通知文本仍是初始值
+$ adb shell 'dumpsys notification ... | grep dyrpa | grep android.text'
+android.text=String (正在连接 broker…)
+
+# 4. MQTT 连接线程 Thread-4 state=S 等了 18 分钟没动
+$ adb shell 'cat /proc/<PID>/task/<MQTT_TID>/status | grep State'
+State: S (sleeping)
+
+# 5. Service 是 foreground,18 分钟前 create,4 分钟前还有 activity
+$ adb shell 'dumpsys activity services com.dyrpa.agent'
+ServiceRecord{... AgentService}
+  isForeground=true
+  createTime=-18m51s
+  lastActivity=-4m54s
+```
+
+总结:Service 在跑、配置存对了、socket 没建、连接线程 hang 着等 socket 一直没回来。
+
+### 根因
+
+`apk/.../service/AgentService.kt:54-64` 是经典的"一次性 lazy init"模式:
+
+```kotlin
+override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    val broker = intent?.getStringExtra(EXTRA_BROKER) ?: return START_NOT_STICKY
+    val deviceId = intent.getStringExtra(EXTRA_DEVICE_ID) ?: return START_NOT_STICKY
+    startForeground(NOTIFY_ID, buildNotification("正在连接 broker…"))
+    if (mqtt == null) {                                  // ← 致命守卫
+        val client = MqttClient(broker, deviceId, ...)
+        mqtt = client
+        client.connect { updateNotification("已连接 ...") }
+        ...
+    }
+    return START_STICKY
+}
+```
+
+事件链(用户 reproducible):
+1. 用户**第一次点启动**:broker 填了错的 URL(或残留的 `tcp://YOUR.SERVER:1883` 占位符)
+2. MqttClient 用错的 URL 创建,`client.connect()` 卡 SYN_SENT 阶段无限等(Paho 的 `connectionTimeout=10` **不会**让 Socket connect 真在 10s 内放弃 — 详见下文配套问题)
+3. 用户发现没连上,回 MainActivity 改 broker → SharedPrefs 存对了
+4. 用户**再次点启动**按钮 → MainActivity 触发 `startForegroundService(intent)` → AgentService.onStartCommand 被第二次调用
+5. 走到 `if (mqtt == null)` —— `mqtt` **不为 null**(上一个错 URL 的 client 还挂在那)→ **整个 if 块跳过** → 新 broker URL 永远不传到 MqttClient → 通知卡在初始 "正在连接 broker…" 文本不变
+6. Foreground Service `START_STICKY` 永久保留,直到 `am force-stop` 或手动停止才重置
+
+### 配套问题:Paho `client.connect()` 不严格遵守 connectionTimeout
+
+我们 connect opts 里设了 `connectionTimeout = 10`,理论上 Paho `connect()` 应该 10s 内抛 MqttException 进 catch 块 → 触发 `onDisconnected` → 通知变 "断连: ... · 自动重连中"。
+
+实际上 Paho 在 Java Socket connect 阶段(TCP SYN_SENT)对错 endpoint 不会及时放弃,可能 hang 几十分钟。这是 Paho 的二级 bug,暂时被 AgentService 守卫掩盖,未来若改了 AgentService 但 Paho 这条仍在,需要单独治理(可能要包装 Socket factory 强制 connectTimeout)。
+
+### 临时绕过(已验证 2026-05-18)
+
+```bash
+# 通过 TCP adb 强杀 dyrpa-agent
+adb -s <phone_ip>:5555 shell 'am force-stop com.dyrpa.agent'
+# 然后手机端打开 dyrpa-agent → 点 [1] 请求 Shizuku 权限 → 点 [2] 启动 agent
+```
+
+force-stop 杀进程 → JVM 退出 → `mqtt` 引用清零 → 下次 onStartCommand 走 if 块 → 用 SharedPrefs 里的新 broker 重建。秒连。
+
+### 修复(2026-05-18 已做)
+
+`AgentService.kt onStartCommand` 检测配置变化时主动重建:
+
+```kotlin
+private var currentBroker: String? = null
+private var currentDeviceId: String? = null
+
+override fun onStartCommand(intent: Intent?, ...): Int {
+    val broker = intent?.getStringExtra(EXTRA_BROKER) ?: return START_NOT_STICKY
+    val deviceId = intent.getStringExtra(EXTRA_DEVICE_ID) ?: return START_NOT_STICKY
+    startForeground(...)
+    // 配置变了 → 拆掉旧的
+    if (mqtt != null && (currentBroker != broker || currentDeviceId != deviceId)) {
+        Log.i(TAG, "config changed, recreating mqtt: $currentBroker → $broker, $currentDeviceId → $deviceId")
+        mqtt?.disconnect()
+        mqtt = null
+    }
+    if (mqtt == null) {
+        currentBroker = broker
+        currentDeviceId = deviceId
+        // ... 原 MqttClient 创建逻辑
+    }
+    return START_STICKY
+}
+```
+
+附加增强(可选):MainActivity 启动按钮的 onClick 里**主动 disconnect 旧 service 后再 startForegroundService**,避免 race。
+
+### 关键不变量(未来改 AgentService 时遵守)
+
+1. **Foreground Service 是 sticky 的,onStartCommand 多次调用必须支持配置变化**。任何"一次性 lazy init"守卫遇到新 intent extras 时必须重新评估
+2. **UI 状态(通知 / status 文本)必须反映真实连接状态**,不能只反映 startForegroundService 调用成功(那只代表 Service 拉起来,不代表 MQTT 通)
+3. **Paho `client.connect()` 不可信任 connectionTimeout** — 真在不可达 endpoint 上会 hang;未来要么换异步 connect API,要么自己包 Socket factory
+
+### Commits
+
+- `dfb7e30` fix(mqtt): SIM 弱网根治 ← 引入了这个守卫的代码已在 master
+- 后续 commit:fix(service): onStartCommand 配置变化时重建 MqttClient(未做)
+
+### 引用
+
+- `apk/app/src/main/java/com/dyrpa/agent/service/AgentService.kt:48-66`
+- `apk/app/src/main/java/com/dyrpa/agent/MainActivity.kt:81-92`(调用方)
+
+---
+
 ## 2026-05-18 · SIM 卡蜂窝下 workflow 静默卡死 (Paho QoS 1 同步阻塞)
 
 ### 现象

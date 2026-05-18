@@ -10,7 +10,7 @@
 - `adb shell ps -A | grep shizuku_server` **无输出**(只有 `moe.shizuku.privileged.api` 是 manager app,不算)
 - dyrpa-agent 报 "Shizuku 未运行" / "权限未授予"
 - workflow 全部步骤秒失败,日志 `Shizuku.newProcess() unavailable`
-- APK 刚 reinstall 完(reinstall 经常带把 shell-UID daemon 抄了)
+- APK 刚通过 **USB** reinstall 完(USB transport 状态变化触发 adbd 清理 shell-UID 子进程;**纯 TCP install 不会杀 shizuku**,2026-05-18 honor50-02 实证)
 
 ---
 

@@ -62,6 +62,7 @@ function renderDevices(list) {
               <span class="dot ${dotCls}"></span>
             </div>
             <div class="tile-meta">${escapeHtml(d.manufacturer || "")} ${escapeHtml(d.model || "")} · Android ${escapeHtml(d.android || "—")}</div>
+            <div class="tile-row"><span class="label">ID</span><span class="value">${escapeHtml(d.id)}</span></div>
             <div class="tile-row"><span class="label">心跳</span><span class="value">${ago(d.last_seen)}</span></div>
             <div class="tile-row"><span class="label">电量</span><span class="value">${battery}</span></div>
             <div class="tile-row"><span class="label">任务</span><span class="value">${escapeHtml(taskInfo)}</span></div>

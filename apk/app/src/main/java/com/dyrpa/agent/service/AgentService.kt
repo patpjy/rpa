@@ -29,6 +29,13 @@ class AgentService : Service() {
     private var mqtt: MqttClient? = null
     private var interpreter: Interpreter? = null
     @Volatile private var running = false
+    // Track config so onStartCommand can detect "user changed broker/device_id and tapped
+    // 启动 again" — the MainActivity calls startForegroundService with new extras, but the
+    // Service is sticky and already has an MqttClient with the old config. Without these
+    // sentinels we silently keep using the stale config (see BUGS.md 2026-05-18 entry 1).
+    private var currentBroker: String? = null
+    private var currentDeviceId: String? = null
+    private var heartbeatThread: Thread? = null
 
     // Dedup state: on flaky cellular, MQTT QoS 1 broker re-delivers task messages
     // when a PUBACK is lost. Without dedup that spawns parallel workflow threads
@@ -51,7 +58,20 @@ class AgentService : Service() {
 
         startForeground(NOTIFY_ID, buildNotification("正在连接 broker…"))
 
+        // User reconfigured broker/device_id and re-tapped 启动:
+        // MainActivity called startForegroundService with new extras, but our sticky
+        // Service is still holding an MqttClient with the OLD config. Detect the change
+        // and tear it down so the if-null block below rebuilds with new config.
+        // (Pre-fix behavior: silently kept stale MqttClient forever; user had to
+        //  `adb shell am force-stop com.dyrpa.agent` to recover.)
+        if (mqtt != null && (currentBroker != broker || currentDeviceId != deviceId)) {
+            Log.i(TAG, "config changed (broker $currentBroker→$broker, device $currentDeviceId→$deviceId); rebuilding")
+            teardownAgent()
+        }
+
         if (mqtt == null) {
+            currentBroker = broker
+            currentDeviceId = deviceId
             val client = MqttClient(broker, deviceId, this::onTask, this::onControl, this::onDisconnected)
             mqtt = client
             interpreter = Interpreter(applicationContext, client, broker)
@@ -60,12 +80,26 @@ class AgentService : Service() {
                 client.publishHeartbeat(DeviceInfo.collect(applicationContext))
             }
             running = true
-            startHeartbeatLoop()
+            heartbeatThread = startHeartbeatLoop()
         }
         return START_STICKY
     }
 
-    private fun startHeartbeatLoop() {
+    /** Tear down current MqttClient + interpreter + heartbeat thread. Safe to call
+     *  when nothing's running (no-op on null fields). */
+    private fun teardownAgent() {
+        running = false
+        heartbeatThread?.interrupt()
+        heartbeatThread = null
+        try { mqtt?.disconnect() } catch (_: Exception) {}
+        mqtt = null
+        interpreter = null
+        // Don't clear currentBroker/currentDeviceId here — onStartCommand sets them
+        // freshly before the next init, and clearing would lose the comparison baseline
+        // if onDestroy fires between onStartCommand calls.
+    }
+
+    private fun startHeartbeatLoop(): Thread =
         Thread {
             while (running) {
                 try {
@@ -76,8 +110,7 @@ class AgentService : Service() {
                 try { Thread.sleep(HEARTBEAT_INTERVAL_MS) }
                 catch (_: InterruptedException) { return@Thread }
             }
-        }.start()
-    }
+        }.apply { isDaemon = true; name = "dyrpa-heartbeat"; start() }
 
     private fun onTask(taskJson: String) {
         Log.i(TAG, "task received (${taskJson.length} bytes)")
@@ -141,9 +174,7 @@ class AgentService : Service() {
     }
 
     override fun onDestroy() {
-        running = false
-        mqtt?.disconnect()
-        mqtt = null
+        teardownAgent()
         if (::wakeLock.isInitialized && wakeLock.isHeld) wakeLock.release()
         super.onDestroy()
     }

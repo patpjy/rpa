@@ -1,345 +1,427 @@
-# 抖音 RPA 控制台
+# 抖音 RPA — 单机 V9.1 + 群控架构
 
-> Mac 通过 USB 控制安卓手机自动跑抖音工作流：搜关键词 → 进视频 → 关注 → 发私信 → 滑下一条。带 Web 控制台、多工作流、实时日志、截图回放、失败自动 dump。
+抖音矩阵号自动化(搜词 → 进视频 → 关注 → 发私信)的两套互补架构,**共用同一份 YAML 工作流**:
 
----
+* **V9.1 单机**:Mac + USB + ADB + uiautomator2,3-5 台手机,生产可用,源码 818 行
+* **群控**:VPS + Android APK(Kotlin)+ Shizuku + MQTT,目标 10-30 台,**装机后无 USB / 无 WiFi,纯蜂窝独立运行**
 
-## 1. 是什么
-
-```
-┌──────────┐        HTTP/SSE        ┌──────────┐         USB+ADB         ┌──────────┐
-│ 浏览器    │ ──────────────────────→│ Mac 后台  │ ───────────────────────→│ 安卓手机  │
-│ 控制台    │←── 实时日志 / 截图 ────│ Flask+   │←── UI dump / screencap ─│ 抖音 App  │
-└──────────┘                        │ Python   │                          └──────────┘
-                                    └──────────┘
-```
-
-| 文件 / 目录 | 作用 |
-|------|------|
-| `rpa_mvp.py` | RPA 引擎，按 yaml 描述执行 ADB / uiautomator2 动作 |
-| `dashboard.py` | Flask Web 控制台（端口 8003，SSE 推日志） |
-| `workflows/*.yaml` | 工作流定义，一个文件一个独立场景 |
-| `workflows/_template.yaml` | 新工作流模板（下划线前缀不会出现在下拉菜单） |
-| `templates/index.html` + `static/dashboard.{css,js}` | 控制台前端，纯 HTML/JS 无框架 |
-| `assets/` | 图像匹配模板（`tap_image` 用，例如 `follow_plus.png`） |
-| `backups/` | 历代版本快照（`v8-baseline` / `v8-with-faildump` / `v9-resourceid`） |
-| `outputs/run_*/` | 每次运行的截图 / UI dump / 发送记录（gitignore，不公开） |
+YAML 不动,改的是执行器位置(PC ↔ 手机自身)。
 
 ---
 
-## 2. 快速开始
+## 当前状态(2026-05-15)
 
-### 2.1 Mac 端
+| 阶段 | 状态 | 备注 |
+|---|---|---|
+| **V9.1 单机** | 🟢 生产 | 1 PC × N 手机(USB 常驻),`rpa_mvp.py` + `dashboard.py` |
+| **Phase 1** 公网服务器 | 🟢 已部署 | 腾讯云 VPS 81.69.43.246,FastAPI + Mosquitto + systemd |
+| **Phase 2** APK + 17 action | 🟢 完成 | Kotlin,17/17 actions(`tap_image` / `image_exists` 为 stub,等 OpenCV)|
+| **Phase 3** 无 USB 持久化 | 🟢 实证 | 2026-05-15 honor50-01 拔 USB + 关 WiFi 后 Shizuku 持续运行,workflow 远程可控 |
+| **Phase 4** 工作流真机调优 | 🟡 进行 | candidate 1-3 成功率改善中,forensics + 8s timeout + pipe drain 已修 |
+| **Phase 5** 多机并发 + 风控 + TLS | ⚪ 未启 | 5-10 台并发实测、broker TLS+ACL、包名/痕迹隐藏 |
+
+整体计划草案: `~/.claude/plans/plan-virtual-brooks.md`
+
+---
+
+## 架构对照
+
+```
+V9.1 单机                                 群控架构
+─────────────                             ─────────────
+[Mac]                                     [VPS 81.69.43.246]
+ ├─ Flask :8003 (dashboard.py)             ├─ FastAPI :8000 (server/app/main.py)
+ ├─ rpa_mvp.py 调度                        ├─ Mosquitto :1883 (MQTT broker)
+ └─ uiautomator2 + adb shell               └─ SQLite + UI dumps + 截图存档
+       │                                          │
+       │ USB ADB(必须常驻)                       │ MQTT/HTTP 出向长连接 → 蜂窝
+       ↓                                          ↓
+   [Android 手机]                           [Android 手机 × N(各自蜂窝独立)]
+                                             ├─ DyrpaAgent APK(前台 Service)
+                                             ├─ DyrpaIME(自研 IME,中文 broadcast)
+                                             └─ Shizuku(Rikka 原版,shell UID 守护)
+                                                   │
+                                                   │ Shizuku.newProcess() 本机 binder IPC
+                                                   ↓
+                                             [shell] input / uiautomator dump / screencap
+                                                   ↓
+                                             [抖音]
+```
+
+**为啥群控这么设计:**
+
+| 约束 | 缓解 |
+|---|---|
+| 非 root APK 不能跨 App 模拟点击 | Shizuku 提供 shell UID,所有 action 仍是 shell 命令(`input tap` 等),与 V9.1 同源 |
+| `AccessibilityService` 易被风控识别 | **完全不用无障碍**,Shizuku 走 shell UID + binder |
+| Android 10+ `input text` 多字节 UTF-8 直接 NPE(framework bug) | 内嵌 **DyrpaIME**(InputMethodService),响应 `ADB_INPUT_TEXT` broadcast 提交文字 |
+| 蜂窝 NAT 阻断入向 | APK 主动出向连 broker,服务器 publish 到 device topic |
+| dyrpa-agent 被 OEM 杀后台 | 前台 Service + 启动管理白名单 + 锁屏卡片锁定(`scripts/keepalive_setup.sh`)|
+| **Shizuku 不能跨重启持久化(Android 10 无 root)** | 接受重启后需 USB 重新 bootstrap;运行期(不重启)Shizuku 不死,见下节 |
+| Android 9+ 默认禁明文 HTTP | `network_security_config.xml` 仅白名单 VPS IP(Phase 5 上 TLS 后移除) |
+
+---
+
+## Shizuku 持久化关键(2026-05-15 实证 — 第二轮修正)
+
+**核心结论**:Android 10 + 无 root + HONOR/MagicOS,**启动 shizuku 的时机必须晚于 USB 物理拔除**。USB 在的时候启的 shizuku 拔线必死;USB 拔完让 adbd 进入"无 USB transport"稳态再启的 shizuku 才能持续运行。
+
+```
+✗ 错误顺序: USB 连着 → adb tcpip → 连 TCP → 启 shizuku → 拔 USB
+  →  拔 USB 触发 adbd 整个进程重启(PID 直接换)
+  →  init/HwUsbDeviceManager 钩子清理旧 adbd 名下的所有 shell UID 子进程
+  →  即使 shizuku 已 setsid+nohup+PPID=1+tty=0,daemon 化做得再彻底也被清掉
+  →  ps 列表里直接消失,无 logcat / dmesg 记录(SIGKILL 不可拦截)
+
+✓ 正确顺序: USB 连着 → adb tcpip → 连 TCP → 先拔 USB → 启 shizuku
+  →  拔 USB 时 adbd 重启,但此时还没 shizuku,清理钩子无对象可清
+  →  重启后的新 adbd 处在"只有 TCP transport,USB transport 从未在本进程激活"稳态
+  →  在这个稳态下启的 shizuku,后续没有 USB 事件可触发清理钩子
+  →  Shizuku 持续运行直到手机重启 / 关机
+```
+
+**关键观察**:
+- HONOR 上 USB 物理拔插 = adbd **整个进程换 PID**,不是只关 USB transport(logcat 实证:`adbd 16859 → 17098`)
+- 标准 Unix daemon 化(double-fork、setsid、nohup)在这条 OEM 清理链面前都救不了
+- 之前的"USB-adbd vs TCP-adbd 启动"理解不全 —— 真正决定生死的是 **shizuku 出生时刻 adbd 是否还有 USB transport 状态**
+
+**已排除的伪根因**:
+- 不是 Huawei HiDecision 杀 — 死亡时刻它只是处理 `FileShareWithUSB` 事件的无辜路人
+- 不是 MagicOS 启动管理 / 电池白名单 — 这些管 app UID,管不到 shell UID daemon
+- 不是 Shizuku 本身没 daemonize — `ps -A` 显示 PPID=1 已脱钩,/proc/PID/stat 显示 sid=pid tty=0
+- 不是 OOM / LMK — dmesg / events buffer 都没记录
+
+**2026-05-15 实证**(写进 [[project_shizuku_state]]):
+- USB 在的时候启 shizuku,拔 USB 100% 必死(2 次复现,第二次还加了 nohup setsid 也救不回来)
+- 先拔 USB 让 adbd 进 TCP-only 稳态后再启 shizuku → 多次拔插 USB / 关 WiFi / 切蜂窝都不死
+
+---
+
+## 单机手机 bootstrap SOP
+
+**装机一次,USB 5 分钟搞定,之后蜂窝独立。顺序很关键 — shizuku 必须在 USB 拔完之后才启,见上节说明。**
 
 ```bash
-git clone https://github.com/patpjy/rpa.git
-cd rpa
-brew install android-platform-tools scrcpy
-python3 -m venv .venv
-source .venv/bin/activate
+# === 第 1 段:USB 在的时候(安装 + 配 TCP 通道)===
+
+# 1. 装 APK
+adb install apk/app/build/outputs/apk/debug/app-debug.apk            # dyrpa-agent
+adb install shizuku-v13.6.x.apk                                       # Rikka 原版 Shizuku
+
+# 2. 一键保活(脚本自动:加电池白名单 + 后台运行 + 跳 OEM 启动管理页让你勾)
+./scripts/keepalive_setup.sh
+
+# 3. 切 adbd 到 TCP 模式 + 建 TCP 通道
+adb tcpip 5555
+adb connect <phone_wifi_ip>:5555            # Mac 跟手机得在同一 WiFi 子网
+
+# === 第 2 段:★ 物理拔 USB ★ ===
+#
+# 拔了之后:
+# - adbd 进程会重启(PID 换);此时还没 shizuku,清理钩子无目标
+# - 新 adbd 处在 TCP-only 稳态(USB transport 从未在它的本次生命周期激活)
+# - Mac 端 `adb devices` 还能通过 WiFi 看到 <wifi_ip>:5555 仍 device 状态
+
+# === 第 3 段:在 USB 已拔的状态下启 shizuku(关键)===
+
+# 4. 通过 TCP 启 shizuku — 这是它"出生"时刻,adbd 已经没 USB 状态可清理
+adb -s <phone_wifi_ip>:5555 shell /data/app/moe.shizuku.privileged.api-*/lib/arm64/libshizuku.so
+
+# 5. 验证活: 进程 PPID=1 + Shizuku App 主界面显示"运行中,版本 13.x"
+adb -s <phone_wifi_ip>:5555 shell ps -A -o PID,PPID,USER,ARGS | grep shizuku_server
+
+# 6. 手机端 UI:
+#   a. dyrpa-agent → 请求 Shizuku 权限 → 同意 → 配 broker tcp://81.69.43.246:1883 + device_id → 启动
+#   b. 设置 → 应用 → 启动管理 → dyrpa agent → 关自动管理 + 勾 [自启动][关联启动][后台活动]
+#   c. 最近任务卡片长按上滑锁定
+
+# 7. 关 WiFi + 插流量卡 + 开蜂窝数据 — Mac 失去 adb 链路,但生产期 Mac 不在链路里
+#    Shizuku 是手机本地 daemon,网络切换不影响它
+#    dyrpa-agent 走 MQTT isAutomaticReconnect,蜂窝起来自动重连 broker
+```
+
+**关键反面教材**:`adb tcpip 5555` 之后**直接**通过 TCP 启 shizuku,然后再拔 USB —— 这条路 HONOR 上必死,加任何 daemon 化技巧都救不回来。原因见上节"Shizuku 持久化关键"。
+
+**这之后的所有维护都不需要再连 USB**,除非:
+- 手机重启 — `service.adb.tcp.port=5555` 是运行时属性,重启丢失。要从步骤 3 重跑(~2 分钟)
+- 手机断电关机 — 同上
+
+实测预估每月级别需要一次维护,可接受。批量扩 10+ 台时把上面打包成 `scripts/bootstrap_phone.sh`。
+
+---
+
+## 项目结构
+
+```
+rpa/
+├── README.md                       本文件
+├── requirements.txt                V9.1 Python 依赖
+├── rpa_mvp.py                      V9.1 引擎(818 行,uiautomator2 + ADB)
+├── dashboard.py                    V9.1 控制台(Flask :8003)
+├── templates/index.html            V9.1 控制台模板
+├── static/dashboard.{css,js}       V9.1 控制台前端
+├── workflows/                      工作流 YAML(跨架构共用)
+│   ├── _template.yaml              新工作流脚手架
+│   ├── douyin-dm.yaml              抖音私信 v9.1(resource-id 抗漂移)
+│   └── README.md                   编写指南
+├── outputs/                        V9.1 运行产物(.gitignored)
+├── scripts/                        bootstrap / 保活脚本
+│   ├── keepalive_setup.sh          OEM 启动管理 + 电池白名单一键(dyrpa-agent)
+│   └── KEEPALIVE_README.md         各 OEM 白名单详表
+├── phase0-demo/                    早期 Phase 0 验证产物
+│
+├── server/                         Phase 1 公网服务器(FastAPI)
+│   ├── app/main.py                 路由 + ORM + MQTT
+│   ├── app/mqtt_router.py          broker connect + topic push/sub
+│   ├── app/models.py               Device / Task / Run / Step SQLAlchemy
+│   ├── app/workflow_loader.py      yaml 读取 + override 合并
+│   ├── templates/                  Jinja2 (顶层网格 + 单设备 mirror V9.1)
+│   ├── static/                     dashboard css/js
+│   ├── mosquitto/mosquitto.conf    本地 broker 配置示例
+│   └── data/{screenshots,ui_dumps} 设备上传的失败现场(.gitignored)
+│
+└── apk/                            Phase 2 设备端 Kotlin 工程
+    ├── build.gradle.kts            + settings.gradle.kts + gradle.properties
+    └── app/src/main/
+        ├── AndroidManifest.xml     权限 + IME 注册 + cleartext 白名单
+        ├── res/xml/                method.xml (IME 元数据) + network_security_config.xml
+        └── java/com/dyrpa/agent/
+            ├── MainActivity.kt              broker + device_id 配置 UI
+            ├── service/AgentService.kt      前台 Service + 心跳 + MQTT 派发
+            ├── mqtt/MqttClient.kt           Paho 客户端
+            ├── shizuku/ShellExecutor.kt     反射调 Shizuku.newProcess + 并行排空 stdout/stderr
+            ├── input/DyrpaIME.kt            自研 IME,接 ADB_INPUT_TEXT broadcast
+            ├── workflow/{WorkflowModel,Interpreter}.kt  yaml → 步骤执行 + forensics
+            ├── actions/                     17 个 action 实现(2 stub)+ ActionRegistry
+            └── util/{DeviceInfo,ScreenSize,UiTreeFinder,ServerUploader}.kt
+```
+
+---
+
+## V9.1 单机 quick start
+
+```bash
+brew install android-platform-tools
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+
+# 手机进开发者选项(版本号点 7 次)→ 开 USB 调试 + USB 安装
+adb devices                            # 验证识别
+.venv/bin/python dashboard.py          # http://127.0.0.1:8003
 ```
 
-### 2.2 手机端（HUAWEI / 荣耀示例）
-
-1. 设置 → 关于手机 → 连续点版本号 7 次 → 进开发者模式
-2. 系统和更新 → 开发人员选项 → 打开：
-   - ✅ **USB 调试**
-   - ✅ **仅充电模式下允许 ADB 调试**
-   - ✅ **USB 安装**
-3. 插 USB → 手机端选「**传输文件**」（不能只是充电）
-4. 弹「允许 USB 调试」→ 勾「始终允许」→ 允许
-
-其他品牌路径见 [§7](#7-手机端配置其他品牌)。
-
-### 2.3 验证连接
-
-```bash
-adb devices
-# 应该看到一行 <序列号>  device
-```
-
-### 2.4 启动控制台
-
-```bash
-.venv/bin/python dashboard.py
-```
-
-浏览器打开 **http://127.0.0.1:8003** 就能用了。控制台只绑回环地址，不对外暴露。
+各品牌开发者选项入口见[文末附录](#手机端开发者选项各品牌路径)。完整 yaml 编写 + failed dump 调试见 `workflows/README.md`。
 
 ---
 
-## 3. 控制台用法
+## 群控架构 quick start
 
-```
-┌──────────────────────┐  ┌─────────────────────────────┐
-│ 设备状态              │  │ 实时日志（SSE 推流）          │
-│  ● 序列号 / 厂商      │  │ [13:03:20] screenshot ...   │
-│  IP / MAC / 电量      │  │ [13:03:21] tap desc='关注'  │
-│  分辨率 / 前台 / 屏幕 │  │ ...                         │
-├──────────────────────┤  │                             │
-│ 任务进度  2/2  ▰▰▰▰  │  │                             │
-├──────────────────────┤  │                             │
-│ 控制                  │  │                             │
-│  工作流 [下拉 ▾]      │  │                             │
-│  候选数 [_]  关键词 [_]│  │                             │
-│  私信话术 [文本框]    │  │                             │
-│  [▶ inspect] [▶ 启动] │  │                             │
-│  [■ 停止]             │  │                             │
-└──────────────────────┘  └─────────────────────────────┘
-┌────────────────────────────────────────────────────────┐
-│ 最新截图（运行中实时刷新）                              │
-└────────────────────────────────────────────────────────┘
+### A. 本地 server 开发
+
+```bash
+cd server
+/Users/pat/Desktop/rpa/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+brew install mosquitto && mosquitto -c mosquitto/mosquitto.conf   # 跑真机时需要
 ```
 
-**操作流程**：
-1. 浏览器打开 http://127.0.0.1:8003
-2. 设备状态显示 🟢 + 序列号 = 连接 OK
-3. 选工作流（默认「抖音私信」v9）
-4. 候选数 / 关键词 / 私信话术随时改 —— 三个字段自动存 `localStorage`，关浏览器换设备都不丢
-5. **手机不用回首页**，工作流会自己 force-stop + monkey 冷启抖音
-6. 点 **▶ 启动 workflow**
-7. 看右侧日志和下方截图，跑完进度条满
+* 顶层网格:`http://localhost:8000/`
+* 单设备:`http://localhost:8000/devices/<device_id>`
 
-**inspect 按钮**：只截图 + 抓 UI 树（输出到 `outputs/inspect_<ts>/`），**不点任何东西**。调试新关键词、新 UI 时用。
+### B. 部署 / 同步到 VPS
 
-**私信话术输入框**：留空 = 用 yaml `drafts.dm_template` 默认值；非空 = 覆盖。话术里的 `{keyword}` 占位符会被实际关键词替换。
+服务器位置 `/home/ubuntu/dyrpa/{server,workflows,data,.venv}`,systemd 单元 `dyrpa-server.service`,Mosquitto `/etc/mosquitto/conf.d/dyrpa.conf` 听 `0.0.0.0:1883`。
 
-**停止按钮**：每个 action 开头和长 `wait` 内部都会查 stop 标志，<1s 内生效。
+本地 `~/.ssh/config`(必须 `BindInterface=en0` 绕 V2RayN TUN):
+
+```
+Host dyrpa
+    HostName 81.69.43.246
+    User ubuntu
+    IdentityFile ~/.ssh/exam_generator_tencent_ed25519
+    BindInterface en0
+    ServerAliveInterval 60
+```
+
+修后端代码:
+
+```bash
+rsync -avz server/app/ dyrpa:/home/ubuntu/dyrpa/server/app/
+ssh dyrpa "sudo systemctl restart dyrpa-server"
+```
+
+修 yaml / static:rsync 即可不用重启(yaml dispatch 时加载,static uvicorn 直接读盘)。
+
+### C. 手机端 bootstrap
+
+见上文 [单机手机 bootstrap SOP](#单机手机-bootstrap-sop)。
+
+### D. dashboard 访问 — V2RayN 全局 TUN 加速
+
+V2RayN TUN 强制全局时直连 VPS 会绕海外节点变慢。开 SSH 隧道走 `BindInterface=en0`:
+
+```bash
+ssh -fN -L 8888:127.0.0.1:8000 dyrpa
+# 浏览器 http://localhost:8888/devices/<id>
+```
+
+杀掉 `pkill -f 'ssh.*8888'`。
 
 ---
 
-## 4. 改 / 加工作流
+## V9.1 → 群控 概念映射
 
-### 4.1 改现有工作流
+| V9.1(Python 单进程) | 群控(server + APK) |
+|---|---|
+| 全局 `STATE` dict | `Device` 表 per-device 状态 + `Task` per-run |
+| localStorage 持久化输入框 | `POST /api/devices/{id}/overrides` → SQLite |
+| `LOG_BUFFER` 环形 deque | `log_bus.py` per-device 缓冲 + async SSE |
+| `STATE.last_screenshot` | `Device.last_screenshot_path` + `server/data/screenshots/<id>/` |
+| 同步 `run_workflow(yaml)` | `mqtt_router.push_task(device_id, payload)` 异步 |
+| `execute_steps(steps)` (Python) | `workflow/Interpreter.kt`(Kotlin,设备端) |
+| 17 个 action 函数 | `actions/<Name>.kt` + `ActionRegistry` |
+| `u2.click_text("X")` | `uiautomator dump` → 正则解析 → `input tap X Y` |
+| `device.input_text()`(Unicode OK) | **DyrpaIME** 接 broadcast → `commitText` |
+| `outputs/run_*/` 本地落盘 | HTTP POST `/api/devices/{id}/screenshots` + `/ui-dumps` |
+| 单设备 1 task | N 设备并发,每设备独立 task slot |
 
-直接编辑 `workflows/douyin-dm.yaml`。改完**刷新浏览器**生效（不用重启后端）。
+---
 
-关键字段：
+## 17 个 Action 实现矩阵
+
+| Action | V9.1 | APK | 备注 |
+|---|---|---|---|
+| `wait` / `press` / `tap_xy` / `swipe` | ✓ | ✓ | 纯 shell,无 UI tree 依赖 |
+| `tap_text` / `tap_desc` / `tap_resource_id` | ✓ | ✓ | `uiautomator dump` → 正则查 `text=` / `content-desc=` / `resource-id=`,**默认 timeout 8s**(适配 shell dump 慢) |
+| `input_text` | ✓ | ✓ | APK 自动切到 DyrpaIME → broadcast → 切回原 IME |
+| `screenshot` / `dump_hierarchy` / `collect_visible_text` | ✓ | ✓ | 截图/UI XML 失败时自动 HTTP 上传到 forensics |
+| `tap_xy_if_missing` / `tap_relative_to_element` | ✓ | ✓ | 组合 dump + tap |
+| `skip_if_exists` / `skip_if_not_exists` | ✓ | ✓ | 短路控制,与 `optional:true` 配合 |
+| `tap_image` / `image_exists` | ✓ | **stub** | APK 端 OpenCV +40MB,Phase 5 abiSplit 或改服务器侧匹配 |
+
+---
+
+## 关键实现细节
+
+### Forensics 自动上传(bug 定位机制)
+
+任何 action 失败(不分 optional)→ `Interpreter` catch:
+1. 标签 `${section}_step${i}_${action}`
+2. `ShellExecutor.uiDump()` 抓当前 UI XML,POST `/api/devices/{id}/ui-dumps`
+3. 非 optional 再走 `screencapAndUpload` 传 PNG
+4. `task_failed` 载荷含 `section / step_index / step_type / forensics_label`,dashboard 直跳关联截图 + UI XML
+
+→ 抖音 UI 漂移时 1 次 run 即拿证据,不靠蒙猜。
+
+### ShellExecutor 并发排空 stdout/stderr(pipe 死锁修复)
+
+```kotlin
+// ❌ 原写法(Java Runtime.exec 经典死锁)
+val exit = proc.waitFor()          // 阻塞等
+val stdout = proc.inputStream.bufferedReader().readText()   // 死锁:stdout 写 >64KB,子进程 write 阻塞,waitFor 永远不返回
+
+// ✓ 修后(2026-05-15)
+val tOut = Thread { stdout = proc.inputStream.bufferedReader().readText() }
+val tErr = Thread { stderr = proc.errorStream.bufferedReader().readText() }
+tOut.start(); tErr.start()
+val exit = proc.waitFor()
+tOut.join(); tErr.join()
+```
+
+抖音视频详情页 UI XML ~200KB,远超 Linux pipe buffer 默认 64KB。修前 100% 死锁后被 watchdog SIGTERM(exit=143);修后干净通过。
+
+V9.1 副本2 没这问题,因为它用 uiautomator2 的 instrumentation server 通过 socket 流式传 XML,不走 pipe buffer。
+
+### tap_* 默认 timeout 3s → 8s
+
+V9.1 用 uiautomator2 dump ~300ms,3s timeout 允许 7+ 次 retry。我们 APK 用 shell `uiautomator dump` 一次 ~2.5s,3s 只够 1 次 retry,抖音视频页元素晚渲染时必丢。8s 允许 2-3 次 retry,大多数 timing edge case 能 hit。
+
+具体值在 `TapDesc/TapText/TapResourceId.kt:15` 默认参数,yaml 里 `timeout: <seconds>` 可覆盖。
+
+### DyrpaIME(自研输入法 + 自动 IME 切换)
+
+Android 10 内置 `input text "<中文>"` 直接 NPE(framework bug)。我们走 shell broadcast,要求当前 IME 是 DyrpaIME。
+
+```kotlin
+// InputText.kt
+val saved = ShellExecutor.run("settings get secure default_input_method").stdout.trim()
+if (saved != DYRPA_IME) {
+    ShellExecutor.run("ime set $DYRPA_IME")
+    Thread.sleep(500)          // 等 IME 绑定到焦点
+}
+ShellExecutor.inputText(text)  // am broadcast -a ADB_INPUT_TEXT --es msg "..."
+ShellExecutor.run("ime set $saved")   // 切回原 IME,保证你日常能在手机上手动打字
+```
+
+DyrpaIME 自身就一个 `InputMethodService` + 一个 `BroadcastReceiver`,收到广播 `commitText(msg, 1)`,无可见键盘。
+
+### 工作流 YAML(简版)
+
 ```yaml
-meta:
-  name: "抖音私信"                 # 控制台下拉显示的名字
-  description: "..."             # 鼠标悬停或控制台描述
+meta: { name: "抖音私信", version: "9.1", description: "..." }
+app:  { package: com.ss.android.ugc.aweme }
 workflow:
-  keyword: "北京海淀二手房"        # 默认关键词（可被 dashboard 覆盖）
-  max_items: 3                  # 默认候选数（可被覆盖）
-  wait_after_action: 0.3        # 每步默认等待秒数
-  open_search: [...]            # 从首页到搜索页的动作（执行一次）
-  submit_search: [...]          # 提交搜索 + 进第一个视频（执行一次）
-  per_item: [...]               # 每个候选博主的完整闭环（执行 max_items 次）
+  keyword: "..."                              # dashboard / per-device 可覆盖
+  max_items: 3
+  open_search:    [ {action: wait, seconds: 5}, {action: tap_xy, x: 0.92, y: 0.06}, ... ]
+  submit_search:  [ {action: input_text, value_from: keyword}, ... ]
+  per_item:       [ {action: tap_desc, value: "关注", optional: true}, ... ]   # 循环 max_items 次
 drafts:
-  dm_template: "您好..."        # 固定话术（支持 {keyword} 占位符）
+  dm_template: "您好...{keyword}"             # {keyword} 自动替换
 ```
 
-### 4.2 加新工作流
-
-```bash
-cp workflows/_template.yaml workflows/<新工作流-id>.yaml
-# 编辑文件，改 meta / keyword / per_item / dm_template
-```
-
-刷新浏览器 → 下拉里出现新工作流。详见 [`workflows/README.md`](workflows/README.md)。
-
-### 4.3 工作流的动作 DSL
-
-引擎共支持 16 个 action。完整速查见 `workflows/_template.yaml` 底部，常用如下：
-
-**点击类**
-
-| action | 关键参数 | 说明 |
-|--------|---------|------|
-| `tap_text` | `value: "搜索"` `clickable: true` | text 匹配，找到后用 `adb input tap` 打中心 |
-| `tap_desc` | `value: "关注"` `clickable: true` | content-desc 匹配（找按钮首选） |
-| `tap_resource_id` | `value: "com.ss.android.ugc.aweme:id/user_avatar"` | Android resource-id 匹配。比 `tap_xy` 多 ~200ms 但**抗布局漂移**（视频带挂件 / 合集时右侧栏整体上移，绝对像素必落空） |
-| `tap_xy` | `x: 0.5` `y: 0.3` | 比例坐标（0-1） |
-| `tap_xy_if_missing` | `text` 或 `desc` + `x` `y` | 元素不存在才落坐标 —— 二选一兜底 |
-| `tap_relative_to_element` | `anchor_text` 或 `anchor_desc` + `dx` `dy` | 找锚点元素后偏移 N 像素 tap —— 抖音 SurfaceView 头像兜底 |
-| `tap_image` | `template: assets/x.png` `threshold: 0.8` | 多尺度模板匹配 + 随机抖动 |
-
-**输入 / 系统**
-
-| action | 关键参数 | 说明 |
-|--------|---------|------|
-| `input_text` | `value: "..."` 或 `value_from: keyword/dm_template` | 用 ADBKeyboard 支持中文 |
-| `press` | `key: back/enter/home` | 系统键 |
-| `swipe` | `start: [0.5, 0.8]` `end: [0.5, 0.2]` `duration: 0.4` | 比例滑动 |
-| `wait` | `seconds: 1.5` | 死等。短切片循环，长 wait 也能秒停 |
-
-**采集 / 控制流**
-
-| action | 关键参数 | 说明 |
-|--------|---------|------|
-| `screenshot` | `name: first_video` | 存截图到 `outputs/run_*/` |
-| `collect_visible_text` | `name: ui` | 抓 UI 树 + 提取 `text` / `content-desc` / `resource-id` 文本，落 xml |
-| `skip_if_not_exists` | `text` / `desc` / `template` + `reason` | 元素不在 → 抛 `SkipCandidate`，外层自动 swipe 切下一个 |
-| `skip_if_exists` | 同上 | 元素在 → 跳过当前候选（去重用，例如"关注"按钮还在说明没操作过） |
-| 所有 action | `optional: true` | 失败不中断流程 |
-
-**值占位符**：`value_from: keyword` / `value_from: dm_template`，自动取 yaml 默认或 dashboard 覆盖值；dm_template 里的 `{keyword}` 也会被替换。
+`value_from` 支持 `keyword` / `dm_template`(后者做 `{keyword}` 替换),`optional:true` 失败不 kill workflow 只 warn。完整字段见 `workflows/README.md`。
 
 ---
 
-## 5. 调试技巧
+## 故障排查(2026-05-15 实战版)
 
-### 5.1 抓 UI 树（找新按钮）
-
-```bash
-# 推荐: dashboard 上点 inspect, 自动落到 outputs/inspect_<ts>/
-#   ├── current.png
-#   ├── current.xml
-#   └── visible_text.txt  (text/desc/resource-id 去重列表)
-
-# 或手动:
-.venv/bin/python -c "
-import uiautomator2 as u2
-d = u2.connect()
-print(d.dump_hierarchy())
-" > /tmp/dump.xml
-```
-
-### 5.2 测某个坐标 / 文字是否能点
-
-```bash
-adb shell input tap 540 1200             # 比例坐标 → 像素坐标(1080×2340)
-adb shell uiautomator dump /sdcard/u.xml && adb pull /sdcard/u.xml /tmp/
-grep -A1 "发私信" /tmp/u.xml             # 找按钮属性
-```
-
-### 5.3 看当前在哪个 Activity
-
-```bash
-adb shell "dumpsys activity activities" | grep ResumedActivity | head -1
-```
-
-### 5.4 实时投屏看跑流程
-
-```bash
-scrcpy --max-fps=15 -w
-```
-
-### 5.5 失败现场自动 dump
-
-`per_item` 任意一步出错，引擎自动落盘：
-
-```
-outputs/run_<ts>/
-├── _fail_<i>_screen.png    # 失败那一刻的全屏截图
-└── _fail_<i>_ui.xml        # 失败那一刻的完整 UI 树
-```
-
-然后 `back × 3` + 上滑切下一个，**继续后面的候选**。不会因单个失败 abort 整 batch。
+| 现象 | 真实根因 | 修法 |
+|---|---|---|
+| 拔 USB 后 Shizuku UI 显示 "未运行" | **shizuku 在 USB 还插着时启动的** — 拔 USB 触发 adbd 整体重启 + OEM 钩子清理 shell UID 子进程,setsid/nohup 都救不回 | 重做 bootstrap,**严格遵守顺序**:USB 在 → tcpip + connect → **先物理拔 USB** → 在 TCP-only 稳态下启 shizuku(见 bootstrap SOP) |
+| `uiautomator dump failed: exit=143` | **Java Runtime.exec pipe 死锁**(stdout >64KB pipe buffer 满,子进程 write 阻塞,waitFor 永远等不到 exit,15s watchdog SIGTERM) | `ShellExecutor.run` 已上并行 stdout/stderr 排空线程 |
+| candidate 关注偶尔失败 / element not found | UI 渲染晚 + tap_* 默认 3s timeout 仅 1 次 retry | 默认 timeout 提到 8s(2-3 次 retry) |
+| `input_text` broadcast 静默失败 | 当前 IME 不是 DyrpaIME 时 broadcast 无人收 | `InputText.kt` 已加自动切 IME → broadcast → 切回 |
+| `adb install` 返回 `User rejected permissions` | 华为应用市场 `captchakit.CaptchaActivity` 风控滑块 | 手动解一次;adb shell `pm disable-user com.huawei.appmarket` 不彻底(系统还会另起一份),实际可接受为装机一次性成本 |
+| dashboard 显示 "离线" 但 server `online:true` | 前端心跳显示字段没及时刷新 | 强刷浏览器;后续改 `last_seen` 推送 |
+| dashboard 加载极慢 | V2RayN TUN 全局把国内 IP 也代理出去 | 加直连规则,或 SSH 隧道 `localhost:8888` |
+| 服务器 `/api/health` 偶发 `HTTP 000` | 旧 uvicorn 被 SIGTERM 卡 connection drain ~90s | `systemctl restart dyrpa-server` |
+| 截图轮询拉 2MB PNG 卡 dashboard | 自动刷新 1.5s 一次堵带宽 | JS 节流 10s/次,手动走 "刷新" 按钮 |
+| `Shizuku.newProcess` IllegalAccessException | 13.x SDK 标了私有 | 反射调用,见 `shizuku/ShellExecutor.kt` |
 
 ---
 
-## 6. 故障排除
+## 配置 / 端口
 
-| 现象 | 排查 |
-|------|------|
-| `adb devices` 是空 | USB 线只能充电 / 没授权 → 换线、换口、重新允许调试 |
-| 控制台显示「未连接」 | 同上，再刷新浏览器 |
-| `tap_text "搜索"` 失败 | 抖音冷启动慢 → `open_search` 头部 `wait` 加到 5-6s |
-| `tap_text "发私信"` 失败 | 博主主页加载慢 → `obj.exists` timeout 默认 3s，可改 |
-| `tap_text "视频"` 失败 | 还在搜索建议页，没真搜索 → 用 `tap_text "搜索"` 提交 |
-| `input_text` 报 `null object reference` | 上一步没真进入输入框 → 检查 tap 是否命中 |
-| 视频卡片 UI 树没文字 | 抖音 SurfaceView 渲染，只能用 `tap_xy` 比例坐标 |
-| 点头像 `tap_xy` 落到点赞按钮上 | 视频带合集 / 商品挂件，右侧栏整体上移 → 改用 `tap_resource_id` value: `com.ss.android.ugc.aweme:id/user_avatar` |
-| 莫名其妙跳到上次 Activity | `u2.app_start` 在抖音上会 restore → 必须 `adb am force-stop` + `monkey LAUNCHER`（已修） |
-| u2 的 `click()` 没反应 | 抖音视频流吸收合成事件 → 必须 `adb shell input tap`（已修） |
-| `back` 多了跳回搜索结果 | 数层级：私信→主页→视频 是 3 层，回视频只需 2 次 back |
-| MAC 显示「受限」 | 正常，Android 10+ 不让用户拿真实 MAC，只有 root 能 |
-| 浏览器看到旧工作流名 | 改了 yaml 后没刷新浏览器，⌘+R 即可 |
-| 单候选失败后想看现场 | 看 `outputs/run_<ts>/_fail_*_screen.png` 和 `_fail_*_ui.xml` |
+| Key | 默认 | 作用 |
+|---|---|---|
+| `DASHBOARD_PORT` | 8003 | V9.1 `dashboard.py` |
+| dyrpa-server 监听 | 8000 | FastAPI(systemd `dyrpa-server.service`) |
+| Mosquitto 监听 | 0.0.0.0:1883 | broker(`/etc/mosquitto/conf.d/dyrpa.conf`) |
+| adbd TCP 模式 | 5555 | bootstrap 必须切到这里(`adb tcpip 5555`) |
+| VPS SSH | 22 | `~/.ssh/config` alias `dyrpa`,`BindInterface=en0` |
 
 ---
 
-## 7. 手机端配置（其他品牌）
+## 安全 / 合规
 
-| 品牌 | 路径 |
-|------|------|
-| 华为 / 荣耀 | 设置 → 关于手机 → 连续点版本号 |
+* V9.1 默认**全自动发送**,执行到 `tap "发送"` 即真发,无二次确认;节奏 ~22-24 秒/条;抖音对未回复陌生人私信硬限 3 条
+* MVP 阶段服务器明文(HTTP + 无 TLS broker + 匿名 MQTT),只接受信任 IP;Phase 5 上 TLS + ACL
+* `outputs/` / `server/data/` / `*.db` / 凭证 均在 `.gitignore`
+* 自动化操作有账号封禁风险;Phase 1-3 风险面与 V9.1 相同(开发者模式 + shell UID),Phase 5 评估改 Shizuku 包名 + LSPosed 隐藏
+* 仅用于学习与受授权场景
+
+---
+
+## 手机端开发者选项各品牌路径
+
+| 品牌 | 入口 |
+|---|---|
+| 华为 / 荣耀 | 设置 → 关于手机 → 连续点版本号 7 次 |
 | 小米 / Redmi | 设置 → 我的设备 → 连续点 MIUI/HyperOS 版本 |
 | OPPO / realme | 设置 → 关于本机 → 版本信息 → 连续点版本号 |
 | vivo / iQOO | 设置 → 我的设备 → 连续点软件版本号 |
 | 三星 | 设置 → 关于手机 → 软件信息 → 连续点版本号 |
 | 一加 | 设置 → 关于设备 → 连续点版本号 |
-| 原生 Android (Pixel) | 设置 → 关于手机 → 连续点版本号 |
+| 原生 Android(Pixel) | 设置 → 关于手机 → 连续点版本号 |
 
-进开发人员选项后**全打开**：USB 调试 / 仅充电模式下允许 ADB 调试 / USB 安装。
-
----
-
-## 8. 安全 & 合规
-
-- **当前默认全自动发送**，不二次确认 —— 引擎执行到 `tap "发送"` 即真发
-- 私信节奏：**~22-24 秒 / 条**（冷启 + 搜索 + 关注 + 头像 resource-id 抓 UI + 发送 + back×2 + swipe；v9 因 resource-id 比 v8 多 ~200ms）
-- 抖音对**陌生人私信**有硬限制：未回复前最多 3 条
-- 抖音用户协议禁止「未经授权的自动化访问」，自动操作有**账号封禁**风险
-- 单候选失败自动 dump `_fail_*` 取证，不影响后续候选
-- `outputs/` 已加入 `.gitignore`，里面的真实截图 / 私信记录不上传
-- 项目仅供学习和受授权场景使用
-- 用户的实际经验：手动 200 条/天没事，自动节奏请根据账号状态调整
-
----
-
-## 9. 端口和环境变量
-
-| 变量 | 默认 | 说明 |
-|------|------|------|
-| `DASHBOARD_PORT` | 8003 | 控制台端口 |
-
-```bash
-DASHBOARD_PORT=8888 .venv/bin/python dashboard.py
-```
-
----
-
-## 10. 项目结构
-
-```
-rpa/
-├── README.md                       # 本文件
-├── .gitignore                      # 排除 .venv/、outputs/、*.log、__pycache__/
-├── requirements.txt                # uiautomator2 / PyYAML / opencv / numpy / Pillow / Flask
-├── rpa_mvp.py                      # RPA 引擎
-├── dashboard.py                    # Web 控制台
-├── templates/
-│   └── index.html
-├── static/
-│   ├── dashboard.css
-│   └── dashboard.js
-├── workflows/
-│   ├── douyin-dm.yaml              # 默认工作流：抖音私信 v9
-│   ├── _template.yaml              # 新工作流模板
-│   └── README.md                   # 写新工作流的指南
-├── assets/
-│   └── follow_plus.png             # tap_image 模板示例
-├── backups/                        # 历代快照
-│   ├── v8-baseline/                # v8 基线
-│   ├── v8-with-faildump/           # v8 + 失败自动 dump
-│   └── v9-resourceid/              # v9 头像 resource-id 抗漂移
-├── .venv/                          # (gitignore)
-└── outputs/                        # (gitignore — 含真实业务截图 / 私信记录)
-    ├── inspect_<ts>/
-    │   ├── current.png
-    │   ├── current.xml
-    │   └── visible_text.txt
-    └── run_<ts>/
-        ├── 000_first_video_<ts>.png
-        ├── 001_dm_sent_<ts>.png
-        ├── _fail_<i>_screen.png    # 失败现场（可选）
-        ├── _fail_<i>_ui.xml
-        ├── sent_log.jsonl
-        └── summary.md
-```
-
----
-
-## 11. 技术栈
-
-- [ADB](https://developer.android.com/tools/adb) —— Android Debug Bridge
-- [uiautomator2](https://github.com/openatx/uiautomator2) —— Python 控 Android
-- [ADBKeyboard](https://github.com/senzhk/ADBKeyBoard) —— 中文输入（已装在手机上）
-- [OpenCV](https://opencv.org/) + [NumPy](https://numpy.org/) + [Pillow](https://python-pillow.org/) —— `tap_image` 多尺度模板匹配
-- [Flask](https://flask.palletsprojects.com/) + SSE —— 控制台后端 + 实时日志推流
-- [scrcpy](https://github.com/Genymobile/scrcpy) —— 投屏（可选，调试用）
-- 前端：原生 HTML/CSS/JS，无框架
+进开发者选项后打开:**USB 调试**(V9.1 必需 + 群控初次配 Shizuku 用)+ **USB 安装**(部分品牌默认关闭)。

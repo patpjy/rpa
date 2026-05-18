@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>抖音 RPA 群控台</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">▶</span>
+      <h1>抖音 RPA 群控台</h1>
+    </div>
+    <div class="topbar-meta">
+      <span id="mqtt-badge" class="port-badge">MQTT: ?</span>
+      <span id="count-badge" class="config-badge">设备: 0</span>
+    </div>
+  </header>
+
+  <main class="devices-page">
+    <section class="batch-bar" id="batch-bar">
+      <div class="batch-row">
+        <label class="batch-label">
+          <input type="checkbox" id="batch-select-all"> 全选
+        </label>
+        <span class="batch-info"><span id="batch-count">0</span> 台已选</span>
+        <select id="batch-workflow"></select>
+        <input type="text" id="batch-keyword" placeholder="覆盖关键词 (空=用各设备自己的)">
+        <input type="number" id="batch-max-items" placeholder="覆盖 max_items" min="0" style="width:120px">
+        <button id="batch-run" class="primary">批量下发</button>
+        <button id="batch-stop">批量停止</button>
+      </div>
+      <p class="batch-hint">
+        每台手机自己设的关键词 / 话术优先生效;批量框只对"没单独设置"的设备生效。
+      </p>
+    </section>
+
+    <section class="device-grid" id="device-grid">
+      <p class="empty-state" id="empty-state">
+        还没有设备注册。等手机端 APK 启动后,会自动发心跳到 MQTT,这里就会出现卡片。
+      </p>
+    </section>
+  </main>
+
+  <footer class="footnote">
+    点击卡片打开单设备控制台 · 每台手机参数独立 · 每 3 秒刷新
+  </footer>
+
+  <script src="/static/devices_index.js"></script>
+</body>
+</html>

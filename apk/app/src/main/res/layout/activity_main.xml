@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:padding="16dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="dyrpa agent"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:paddingBottom="16dp"/>
+
+        <EditText
+            android:id="@+id/editBroker"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="tcp://your.server:1883"
+            android:inputType="textUri"
+            android:layout_marginBottom="8dp"/>
+
+        <EditText
+            android:id="@+id/editDevice"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="device_id"
+            android:inputType="text"
+            android:layout_marginBottom="16dp"/>
+
+        <Button
+            android:id="@+id/btnReqShizuku"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="1. 请求 Shizuku 权限"
+            android:layout_marginBottom="8dp"/>
+
+        <Button
+            android:id="@+id/btnStart"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="2. 启动 agent (连 broker)"
+            android:layout_marginBottom="8dp"/>
+
+        <Button
+            android:id="@+id/btnStop"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="3. 停止 agent"
+            android:layout_marginBottom="16dp"/>
+
+        <TextView
+            android:id="@+id/tvStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#F5F5F5"
+            android:padding="12dp"
+            android:fontFamily="monospace"
+            android:textSize="12sp"
+            android:textIsSelectable="true"
+            android:text="状态…"/>
+    </LinearLayout>
+</ScrollView>

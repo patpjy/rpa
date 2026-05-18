@@ -1,0 +1,67 @@
+# 工作流模板 — 复制这个文件改名,然后改字段
+# 例如: cp _template.yaml my-new-workflow.yaml
+# 改完后 dashboard 自动识别(刷新页面即可)
+
+meta:
+  name: "在 dashboard 上显示的名字"           # 必填
+  description: "一句话说明这个工作流做什么"     # 必填
+  version: 1                                  # 自己版本号
+
+device:
+  serial:                                    # 留空 = 用第一个 USB 连接的设备
+
+app:
+  package: com.ss.android.ugc.aweme          # 目标 app 包名,抖音=这个
+  name: douyin
+
+workflow:
+  keyword: "默认搜索词"                       # dashboard 上可被覆盖
+  max_items: 1                               # 默认跑多少个候选,可被覆盖
+  wait_after_action: 0.5                     # 每个 action 后默认等待秒数
+
+  # 打开搜索的步骤序列(打开 app → 进搜索)
+  open_search:
+    - action: wait
+      seconds: 4
+    - action: tap_desc
+      value: "搜索"
+    - action: wait
+      seconds: 1.5
+
+  # 提交搜索 + 进入第一个候选(切 tab、点视频等一次性步骤)
+  submit_search:
+    - action: input_text
+      value_from: keyword                    # 自动用上面 workflow.keyword
+    - action: tap_text
+      value: "搜索"
+    - action: wait
+      seconds: 3
+    # ... 你的步骤
+
+  # 单个候选人的循环步骤(关注/评论/私信/采集等,会被执行 max_items 次)
+  per_item:
+    # 推荐第一步加去重检查 - 用某个"标志按钮"是否还存在判断
+    # - action: skip_if_not_exists
+    #   desc: "关注"           # 或 text: "..."
+    #   reason: "已操作过这个人,跳过"
+    - action: screenshot
+      name: state
+    # ... 你的步骤
+    # 末尾通常要 swipe 到下一个,否则会一直停在同一个候选
+
+drafts:
+  dm_template: "话术内容,支持 {keyword} 占位符,会被自动替换"
+
+# === 可用 action 速查 ===
+# tap_text     value: "..."                  → 点击带这个 text 的元素
+# tap_desc     value: "..."                  → 点击带这个 content-desc 的元素
+# tap_xy       x: 0-1, y: 0-1                → 按屏幕比例点击坐标
+# tap_image    template: assets/x.png, threshold: 0.8  → 图像匹配后点击(模板放 assets/)
+# input_text   value: "..." 或 value_from: keyword/dm_template  → 在当前 EditText 输入
+# press        key: back/enter/home          → 按系统键
+# swipe        start: [x,y] end: [x,y] duration: 0.4  → 滑动
+# wait         seconds: 2                    → 暂停
+# screenshot   name: xxx                     → 截图到 outputs/run_*/
+# collect_visible_text  name: xxx            → 抓 UI 树文本到候选人记录
+# skip_if_not_exists  text/desc: "..." reason: "..."  → 元素不在 → 跳过当前候选
+# skip_if_exists      text/desc: "..." reason: "..."  → 元素在  → 跳过当前候选

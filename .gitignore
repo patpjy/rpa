@@ -22,3 +22,22 @@ outputs/
 *.log
 /tmp/
 *.tmp
+
+# Android Studio / Gradle (phase0-demo 用户工程产物)
+**/build/
+**/.gradle/
+**/local.properties
+**/.idea/
+**/.cxx/
+**/.externalNativeBuild/
+*.apk
+*.aab
+*.iml
+
+# 心跳服务器运行产物
+phase0-demo/server/hb.log
+
+# 新 server 运行产物
+server/data/
+server/*.db
+server/*.db-journal

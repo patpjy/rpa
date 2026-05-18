@@ -18,9 +18,9 @@
 # 标定截图: outputs/calibration/01..13_*.png
 
 meta:
-  name: "抖音私信 v9.1"
-  description: "v9.1 resource-id 抗漂移版: 搜词 → 进视频 → 关注 → 点头像(按id) → 发私信 → 上滑"
-  version: "9.1"
+  name: "抖音私信"
+  description: "v9 resource-id 抗漂移版: 搜词 → 进视频 → 关注 → 点头像(按id) → 发私信 → 上滑"
+  version: 9
 
 device:
   serial:

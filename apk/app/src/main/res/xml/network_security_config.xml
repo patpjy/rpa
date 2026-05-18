@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Phase 1 server is HTTP (no TLS yet) on Tencent VPS 81.69.43.246.
+  Android 9+ blocks cleartext by default — whitelist that one IP so screenshot/UI XML
+  uploads can reach /api/devices/{id}/screenshots.
+  Phase 4 to-do: enable TLS on the broker + HTTP server, then remove this file.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">81.69.43.246</domain>
+    </domain-config>
+</network-security-config>

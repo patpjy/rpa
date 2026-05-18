@@ -1,0 +1,470 @@
+/* dyrpa dashboard styles — based on V9.1 dashboard.css with extensions for the
+   two-level multi-device layout. Hand-rolled, no framework. */
+
+:root {
+  --bg: #0d1117;
+  --bg-2: #161b22;
+  --bg-3: #1c2128;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --text-dim: #8b949e;
+  --accent: #58a6ff;
+  --accent-2: #2f81f7;
+  --green: #3fb950;
+  --orange: #f78166;
+  --red: #f85149;
+  --yellow: #d29922;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "PingFang SC", monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ============================== topbar ============================== */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 24px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+}
+.brand { display: flex; align-items: center; gap: 12px; }
+.brand .logo {
+  display: inline-grid;
+  place-items: center;
+  width: 28px; height: 28px;
+  background: var(--accent);
+  color: #0d1117;
+  border-radius: 6px;
+  font-weight: bold;
+}
+.brand h1 { margin: 0; font-size: 16px; font-weight: 600; }
+.back-link {
+  display: inline-grid;
+  place-items: center;
+  width: 28px; height: 28px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 18px;
+  text-decoration: none;
+}
+.back-link:hover { color: var(--text); border-color: var(--text-dim); text-decoration: none; }
+
+.topbar-meta { display: flex; gap: 8px; }
+.port-badge, .config-badge {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 4px 10px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-dim);
+}
+
+/* ============================== devices index page (顶层) ============================== */
+.devices-page {
+  padding: 24px;
+}
+.device-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+.device-card-tile {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  cursor: pointer;
+  transition: border-color 0.15s, transform 0.15s;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.device-card-tile:hover {
+  border-color: var(--accent);
+  transform: translateY(-2px);
+}
+.device-card-tile .tile-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.device-card-tile .tile-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0;
+}
+.device-card-tile .tile-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.device-card-tile .tile-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.device-card-tile .tile-row .label { color: var(--text-dim); }
+.device-card-tile .tile-row .value { color: var(--text); font-family: var(--mono); }
+.device-card-tile .progress-track {
+  flex: 1;
+  height: 6px;
+  margin-top: 4px;
+}
+
+.empty-state {
+  color: var(--text-dim);
+  padding: 32px;
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+
+/* ============================== batch dispatch bar ============================== */
+.batch-bar {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+}
+.batch-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.batch-label { display: flex; gap: 6px; align-items: center; color: var(--text); cursor: pointer; }
+.batch-info { color: var(--text-dim); font-family: var(--mono); font-size: 12px; }
+.batch-row select, .batch-row input[type="text"], .batch-row input[type="number"] {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+.batch-row button {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 7px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.batch-row button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+.batch-row button:hover { border-color: var(--accent); }
+.batch-hint { color: var(--text-dim); font-size: 11px; margin: 8px 0 0; }
+
+/* tile checkbox overlay so the link still navigates */
+.tile-select {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  cursor: pointer;
+  z-index: 2;
+}
+.device-card-tile { position: relative; padding: 0; }
+.tile-link {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  color: inherit;
+  text-decoration: none;
+}
+
+/* ============================== screenshot history grid ============================== */
+.history-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  margin-top: 8px;
+}
+.history-item {
+  display: block;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  text-decoration: none;
+  color: inherit;
+  background: var(--bg-2);
+}
+.history-item-fail {
+  border-color: #c0392b;
+  box-shadow: 0 0 0 1px rgba(192, 57, 43, 0.4);
+}
+.history-item img {
+  width: 100%;
+  aspect-ratio: 9/19;
+  object-fit: cover;
+  display: block;
+}
+.history-meta {
+  display: block;
+  padding: 4px 6px;
+  font-size: 10px;
+  font-family: var(--mono);
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ============================== single device grid (复刻 V9.1) ============================== */
+.grid {
+  display: grid;
+  gap: 16px;
+  padding: 16px 24px 24px;
+  grid-template-columns: minmax(260px, 1fr) minmax(0, 2fr);
+  grid-template-areas:
+    "device  logs"
+    "progress logs"
+    "controls logs"
+    "shot     shot"
+    "history  history";
+}
+@media (max-width: 900px) {
+  .grid {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "device"
+      "logs"
+      "progress"
+      "controls"
+      "shot"
+      "history";
+  }
+}
+
+.device-card     { grid-area: device; }
+.logs-card       { grid-area: logs; }
+.progress-card   { grid-area: progress; }
+.controls-card   { grid-area: controls; }
+.screenshot-card { grid-area: shot; }
+.history-card    { grid-area: history; }
+
+/* ============================== card ============================== */
+.card {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-3);
+}
+.card-head h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--text);
+}
+
+/* ============================== device status ============================== */
+.dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.dot-on  { background: var(--green); box-shadow: 0 0 8px rgba(63,185,80,0.6); }
+.dot-off { background: var(--text-dim); }
+.dot-warn { background: var(--orange); }
+.dot-err  { background: var(--red); }
+
+.kv {
+  margin: 0;
+  padding: 14px;
+  display: grid;
+  grid-template-columns: 88px 1fr;
+  gap: 6px 12px;
+  font-size: 13px;
+}
+.kv dt { color: var(--text-dim); }
+.kv dd {
+  margin: 0;
+  font-family: var(--mono);
+  word-break: break-all;
+  color: var(--text);
+}
+
+/* ============================== logs ============================== */
+.logs-card { min-height: 360px; }
+.log-stream {
+  flex: 1;
+  margin: 0;
+  padding: 10px 14px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-y: auto;
+  max-height: 560px;
+  background: var(--bg);
+}
+.log-line { white-space: pre-wrap; }
+.log-line.warn { color: var(--orange); }
+.log-line.err  { color: var(--red); }
+
+/* ============================== progress ============================== */
+.progress-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 14px 4px;
+}
+.progress-track {
+  flex: 1;
+  height: 8px;
+  background: var(--bg-3);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 0.4s ease;
+}
+.progress-text {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  min-width: 56px;
+  text-align: right;
+}
+.task-kind {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-dim);
+}
+.task-kind.running { color: var(--green); border-color: var(--green); }
+.elapsed {
+  padding: 4px 14px 14px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* ============================== controls ============================== */
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 120px;
+  gap: 12px;
+  padding: 14px 14px 6px;
+}
+.form-grid label {
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  color: var(--text-dim);
+  gap: 4px;
+}
+.form-grid-full { grid-column: 1 / -1; }
+.form-grid input,
+.form-grid select,
+.form-grid textarea {
+  padding: 8px 10px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 13px;
+  resize: vertical;
+}
+.form-grid select { cursor: pointer; }
+.form-grid input:focus,
+.form-grid select:focus,
+.form-grid textarea:focus { outline: none; border-color: var(--accent); }
+
+.button-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 14px 12px;
+}
+button {
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-3);
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+button:hover:not(:disabled) { background: var(--border); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button.primary { background: var(--accent-2); border-color: var(--accent-2); color: white; }
+button.primary:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); }
+button.danger { background: var(--red); border-color: var(--red); color: white; }
+button.danger:hover:not(:disabled) { background: #d83a3a; }
+button.ghost { background: transparent; border-color: var(--border); color: var(--text-dim); }
+button.ghost:hover:not(:disabled) { color: var(--text); border-color: var(--text-dim); }
+
+.hint {
+  margin: 0 14px 14px;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+/* ============================== screenshot ============================== */
+.screenshot-frame {
+  padding: 14px;
+  display: grid;
+  place-items: center;
+  min-height: 200px;
+  background: var(--bg);
+}
+.screenshot-frame img {
+  max-width: 100%;
+  max-height: 600px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
+.screenshot-frame img[src=""] { display: none; }
+.empty { color: var(--text-dim); font-size: 13px; }
+
+/* ============================== footnote ============================== */
+.footnote {
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 18px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-2);
+}

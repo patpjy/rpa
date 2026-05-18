@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ device_id }} · 抖音 RPA</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body data-device-id="{{ device_id }}">
+  <header class="topbar">
+    <div class="brand">
+      <a class="back-link" href="/" title="返回设备列表">←</a>
+      <span class="logo">▶</span>
+      <h1 id="device-title">{{ device_id }}</h1>
+    </div>
+    <div class="topbar-meta">
+      <span id="device-badge" class="port-badge">{{ device_id }}</span>
+      <span id="config-badge" class="config-badge">workflow: ?</span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="card device-card">
+      <header class="card-head">
+        <h2>设备状态</h2>
+        <span id="device-dot" class="dot dot-off" title="未连接"></span>
+      </header>
+      <dl id="device-info" class="kv">
+        <dt>状态</dt><dd id="device-status">加载中…</dd>
+      </dl>
+    </section>
+
+    <section class="card logs-card">
+      <header class="card-head">
+        <h2>实时日志</h2>
+        <button id="btn-clear-logs" class="ghost">清空</button>
+      </header>
+      <div id="log-stream" class="log-stream" aria-live="polite"></div>
+    </section>
+
+    <section class="card progress-card">
+      <header class="card-head">
+        <h2>任务进度</h2>
+        <span id="task-kind" class="task-kind">空闲</span>
+      </header>
+      <div class="progress-row">
+        <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
+        <span id="progress-text" class="progress-text">0 / 0</span>
+      </div>
+      <div id="elapsed" class="elapsed">未开始</div>
+    </section>
+
+    <section class="card controls-card">
+      <header class="card-head"><h2>控制</h2></header>
+      <div class="form-grid">
+        <label class="form-grid-full">工作流
+          <select id="workflow"></select>
+        </label>
+        <label>候选数
+          <input id="max-items" type="number" value="1" min="1" max="200">
+        </label>
+        <label>关键词
+          <input id="keyword" type="text" placeholder="(切换工作流自动填)">
+        </label>
+        <label class="form-grid-full">私信话术
+          <textarea id="dm-template" rows="4" placeholder="(切换工作流自动填默认话术,可改)"></textarea>
+        </label>
+      </div>
+      <div class="button-row">
+        <button id="btn-inspect" class="primary">▶ inspect (抓 UI)</button>
+        <button id="btn-workflow" class="primary">▶ 启动 workflow</button>
+        <button id="btn-stop" class="danger">■ 停止</button>
+      </div>
+      <p id="workflow-desc" class="hint"></p>
+    </section>
+
+    <section class="card screenshot-card">
+      <header class="card-head">
+        <h2>最新截图</h2>
+        <button id="btn-refresh-screenshot" class="ghost">刷新</button>
+      </header>
+      <div class="screenshot-frame">
+        <img id="screenshot" alt="尚无截图,跑一次 inspect 或 workflow 试试">
+        <p id="screenshot-empty" class="empty">尚无截图。先跑 inspect 试试。</p>
+      </div>
+    </section>
+
+    <section class="card history-card">
+      <header class="card-head">
+        <h2>截图历史 (含失败现场)</h2>
+        <button id="btn-refresh-history" class="ghost">刷新</button>
+      </header>
+      <div id="screenshot-history" class="history-grid">
+        <p class="empty">还没有截图。</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footnote">
+    每台手机参数独立持久化于服务器(替代 V9.1 localStorage)· 安全模式: 实际发送仍由 workflow 内的 require_manual_send 控制
+  </footer>
+
+  <script src="/static/device_detail.js"></script>
+</body>
+</html>
